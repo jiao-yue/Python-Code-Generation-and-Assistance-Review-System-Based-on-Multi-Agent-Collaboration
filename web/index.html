@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>多智能体 Python 代码生成与辅助审查</title>
+  <!-- 声明无站点图标，避免浏览器自动请求 favicon.ico 产生 404，且不引入任何图片 -->
+  <link rel="icon" href="data:," />
+  <!-- 带版本号，强制浏览器加载最新样式，避免外部浏览器缓存导致页面无样式 -->
+  <link rel="stylesheet" href="/static/styles.css?v=6" />
+</head>
+<body>
+  <div class="app">
+
+    <!-- ============ 左侧窄边栏 ============ -->
+    <aside class="sidebar">
+      <!-- 纯文字标题，不使用任何 logo 或图片 -->
+      <div class="brand">
+        <div class="brand-text">
+          <strong>代码协同审查</strong>
+          <span>多智能体 · Python</span>
+        </div>
+      </div>
+
+      <button class="new-chat" id="newChatBtn">新建对话</button>
+
+      <div class="mode-switch" id="modeSwitch">
+        <button class="mode-btn active" data-mode="generate">
+          <div><b>代码生成</b><small>需求→生成→审核→测试</small></div>
+        </button>
+        <button class="mode-btn" data-mode="review">
+          <div><b>只审核代码</b><small>粘贴代码→审查/测试</small></div>
+        </button>
+      </div>
+
+      <div class="history-title">历史对话</div>
+      <div class="history-list" id="historyList"></div>
+
+      <div class="sidebar-footer" id="healthBox">
+        <span class="dot"></span><span id="healthText">正在连接…</span>
+      </div>
+    </aside>
+
+    <!-- ============ 主对话区 ============ -->
+    <main class="main">
+      <header class="chat-header">
+        <h1 id="chatTitle">代码生成</h1>
+        <span class="header-sub" id="headerSub">描述你的需求，智能体将确认需求并生成、审核、测试代码</span>
+      </header>
+
+      <section class="messages" id="messages">
+        <!-- 空状态欢迎（纯文字，无 logo） -->
+        <div class="welcome" id="welcome">
+          <h2>多智能体 Python 代码生成与辅助审查</h2>
+          <p>输入需求，系统将先确认需求，再生成代码并完成审核与测试</p>
+          <div class="suggestions" id="suggestions">
+            <button class="sug-card">写一个函数，对字符串列表去重并按字典序排序</button>
+            <button class="sug-card">实现一个用户名校验函数，判断长度与合法字符</button>
+            <button class="sug-card">写一个求数字列表平均值的函数，处理空列表</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 底部输入区 ============ -->
+      <footer class="composer">
+        <div class="composer-box">
+          <textarea id="mainInput" rows="1"
+            placeholder="输入你的需求，Enter 发送，Shift+Enter 换行"></textarea>
+
+          <!-- 仅审核模式：可选测试代码 -->
+          <details class="test-extra" id="testExtra">
+            <summary>添加测试代码（可选，用于运行 pytest）</summary>
+            <textarea id="testInput" rows="5"
+              placeholder="粘贴 pytest 测试代码，例如 test_solution.py 的内容"></textarea>
+          </details>
+
+          <div class="composer-bar">
+            <span class="composer-hint" id="composerHint">LLM 需求确认 · 代码生成 · 静态审核 · pytest</span>
+            <!-- 纯文字发送按钮，不使用图标 -->
+            <button class="send-btn" id="sendBtn" title="发送">发送</button>
+          </div>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <script src="/static/app.js?v=6"></script>
+</body>
+</html>

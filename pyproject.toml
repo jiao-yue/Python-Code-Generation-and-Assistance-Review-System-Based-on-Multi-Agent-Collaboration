@@ -1,0 +1,47 @@
+[project]
+name = "graduation-project"
+version = "2.0.0"
+description = "基于多智能体协同的 Python 代码生成与辅助审查系统"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.162.0",
+    "uvicorn[standard]>=0.54.0",
+    "langgraph>=1.2.8",
+    "pydantic>=2.13.4",
+    "openai>=2.44.0",
+    "PyMySQL>=1.2.3",
+    "python-dotenv>=1.2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.17.2",
+    "bandit>=1.9.4",
+]
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+# ---------------------------------------------------------------------------
+# pytest 配置
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+# ---------------------------------------------------------------------------
+# Ruff 静态检查配置
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+# storage 仅存放运行期产物（生成代码、下载资料、日志、结果），不是应用源码，不纳入检查
+extend-exclude = ["storage"]
+
+[tool.ruff.lint]
+# E/F：基础错误与未用变量；I：导入排序；UP：现代语法；B：常见陷阱；SIM：可简化；PERF：性能
+select = ["E", "F", "I", "UP", "B", "SIM", "PERF"]
+# BLE001：在“服务/工具边界”捕获宽泛异常是有意的防御设计，且均已打印或记录，故关闭该提示
+ignore = ["BLE001"]

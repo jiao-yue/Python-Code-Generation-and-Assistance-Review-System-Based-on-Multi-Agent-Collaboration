@@ -1,0 +1,26 @@
+# 多智能体 Python 代码生成与辅助审查系统 —— 依赖清单
+# 安装：pip install -r requirements.txt（本项目使用 uv：uv pip install -r requirements.txt）
+
+# --- 编排框架（LangGraph 状态图）---
+langgraph==1.2.8
+
+# --- 消息模型与数据校验 ---
+pydantic==2.13.4
+
+# --- 大模型 API（OpenAI 兼容接口：DeepSeek / 火山方舟）---
+openai==2.44.0
+
+# --- 后端服务（FastAPI + Uvicorn）---
+fastapi==0.162.0
+uvicorn[standard]==0.54.0
+
+# --- MySQL 持久记忆 ---
+PyMySQL==1.2.3
+
+# --- 配置与环境变量 ---
+python-dotenv==1.2.2
+
+# --- 测试与静态分析（开发期）---
+pytest==9.1.1
+ruff==0.17.2
+bandit==1.9.4
