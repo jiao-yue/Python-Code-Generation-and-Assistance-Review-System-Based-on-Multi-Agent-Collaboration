@@ -11,6 +11,8 @@ dependencies = [
     "openai>=2.44.0",
     "PyMySQL>=1.2.3",
     "python-dotenv>=1.2.2",
+    # RAG 知识库检索：Chroma 持久化向量集合（本地哈希向量，无需在线 embedding）
+    "chromadb>=1.5.9",
 ]
 
 [project.optional-dependencies]

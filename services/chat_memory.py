@@ -166,6 +166,48 @@ class ChatMemory:
         payload = json.dumps(result, ensure_ascii=False)
         self.add_message(conversation_id, "assistant", "result", payload, turn_no, title=title)
 
+    def save_clarification(
+        self,
+        conversation_id: str,
+        mode: str,
+        user_text: str,
+        payload: dict[str, Any],
+        turn_no: int,
+        title: str | None = None,
+    ) -> None:
+        """保存“用户需求 + 待澄清问题”：刷新页面后仍能看到问题卡片。"""
+        self.create_conversation(conversation_id, mode, title or user_text[:18])
+        self.add_message(conversation_id, "user", "text", user_text, turn_no)
+        self.add_message(
+            conversation_id,
+            "assistant",
+            "question",
+            json.dumps(payload, ensure_ascii=False),
+            turn_no,
+            title=title,
+        )
+
+    def save_answer(self, conversation_id: str, answer_text: str, turn_no: int) -> None:
+        """保存用户对澄清问题的补充回答。"""
+        self.add_message(conversation_id, "user", "text", answer_text, turn_no)
+
+    def save_assistant_result(
+        self,
+        conversation_id: str,
+        result: dict[str, Any],
+        turn_no: int,
+        title: str | None = None,
+    ) -> None:
+        """只保存助手结果（用于中断恢复后，避免重复写入用户原始需求）。"""
+        self.add_message(
+            conversation_id,
+            "assistant",
+            "result",
+            json.dumps(result, ensure_ascii=False),
+            turn_no,
+            title=title,
+        )
+
     def save_error(
         self, conversation_id: str, user_text: str, error_message: str, turn_no: int
     ) -> None:
@@ -321,6 +363,12 @@ class ChatMemory:
                 return {"role": row["role"], "kind": "result", "data": json.loads(row["content"])}
             except (TypeError, json.JSONDecodeError):
                 return {"role": row["role"], "kind": "error", "text": "历史结果无法解析"}
+        if kind == "question":
+            # 待澄清问题同样存 JSON：问题列表 + thread_id（用于恢复执行）
+            try:
+                return {"role": row["role"], "kind": "question", "data": json.loads(row["content"])}
+            except (TypeError, json.JSONDecodeError):
+                return {"role": row["role"], "kind": "error", "text": "历史问题无法解析"}
         # 文本与错误都直接使用字符串
         return {"role": row["role"], "kind": kind, "text": row["content"] or ""}
 

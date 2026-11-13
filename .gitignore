@@ -36,6 +36,11 @@ storage/generated/
 storage/logs/
 storage/results/
 storage/downloads/
+# RAG 向量索引、调研下载资料、评估报告都是运行期/本地产物，不提交
+storage/rag/
+storage/rag_research/
+storage/rag_eval_report.json
+storage/*.txt
 
 # ---- IDE / 编辑器 ----
 .idea/

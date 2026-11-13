@@ -20,6 +20,7 @@ from models.chat_schemas import (
     CodeReviewItem,
     CodeReviewReport,
     ConfirmedRequirement,
+    RagHit,
 )
 from models.common import Severity
 from prompts import chat_prompts
@@ -87,26 +88,64 @@ class ChatLLMService:
         data = self._chat_json(system, user)
         return ConfirmedRequirement.model_validate(data)
 
+    def refine_requirement(
+        self, raw_text: str, confirmed: ConfirmedRequirement, answers: list[dict[str, str]]
+    ) -> ConfirmedRequirement:
+        """把用户对澄清问题的回答合并进需求契约。"""
+        system, user = chat_prompts.refine_requirement_prompt(raw_text, confirmed, answers)
+        data = self._chat_json(system, user)
+        return ConfirmedRequirement.model_validate(data)
+
     # ==================================================================
     # 环节 2：代码生成
     # ==================================================================
-    def generate_solution(self, confirmed: ConfirmedRequirement) -> dict[str, str]:
-        """同时生成实现代码与 pytest 测试代码。"""
-        system, user = chat_prompts.generate_solution_prompt(confirmed)
-        data = self._chat_json(system, user)
-        return {
-            "solution_code": self._extract_code(data.get("solution_code", "")),
-            "test_code": self._extract_code(data.get("test_code", "")),
-        }
+    def generate_solution(
+        self, confirmed: ConfirmedRequirement, knowledge_hits: list[RagHit] | None = None
+    ) -> dict[str, str]:
+        """同时生成实现代码与 pytest 测试代码（可注入知识库命中的规范）。
+
+        模型偶尔会返回合法 JSON 但缺少字段，或函数名与需求契约不一致；这里做一次
+        字段级校验并带错误提示重试，避免空代码进入审核/测试节点。
+        """
+        system, user = chat_prompts.generate_solution_prompt(confirmed, knowledge_hits)
+        last_error = ""
+        for _attempt in range(2):
+            current_user = user
+            if last_error:
+                current_user += (
+                    f"\n\n上一次输出不可用（{last_error}），"
+                    "请只输出包含非空 solution_code 与 test_code 的 JSON。"
+                )
+            data = self._chat_json(system, current_user)
+            solution = self._extract_code(data.get("solution_code", ""))
+            test = self._extract_code(data.get("test_code", ""))
+            if not solution:
+                last_error = "solution_code 为空"
+                continue
+            if not test:
+                last_error = "test_code 为空"
+                continue
+            if f"def {confirmed.function_name}" not in solution:
+                last_error = f"实现中缺少函数 {confirmed.function_name}"
+                continue
+            return {"solution_code": solution, "test_code": test}
+        raise RuntimeError(f"代码生成结果不完整：{last_error}")
 
     # ==================================================================
     # 环节 3：代码审核
     # ==================================================================
     def review_code(
-        self, solution_code: str, requirement: str, test_code: str = ""
+        self,
+        solution_code: str,
+        requirement: str,
+        test_code: str = "",
+        knowledge_hits: list[RagHit] | None = None,
+        acceptance_criteria: list[str] | None = None,
     ) -> CodeReviewReport:
-        """以独立上下文从规范、安全、逻辑三视角审核代码。"""
-        system, user = chat_prompts.review_code_prompt(solution_code, requirement, test_code)
+        """以独立上下文从规范、安全、逻辑三视角审核代码（可注入知识库命中的规范）。"""
+        system, user = chat_prompts.review_code_prompt(
+            solution_code, requirement, test_code, knowledge_hits, acceptance_criteria
+        )
         data = self._chat_json(system, user)
 
         items = [
@@ -135,11 +174,7 @@ class ChatLLMService:
         confirmed: ConfirmedRequirement,
     ) -> dict[str, str]:
         """按审核问题做最小化修复。"""
-        issue_lines = [
-            f"行{it.line_no} [{it.view}/{it.severity.value}] {it.issue_type}："
-            f"{it.description} 建议：{it.suggestion}"
-            for it in items
-        ]
+        issue_lines = [self._format_issue(it) for it in items]
         system, user = chat_prompts.fix_code_prompt(
             solution_code, test_code, issue_lines, confirmed
         )
@@ -152,6 +187,15 @@ class ChatLLMService:
     # ==================================================================
     # 工具方法
     # ==================================================================
+    @staticmethod
+    def _format_issue(item: CodeReviewItem) -> str:
+        """把一条审核问题格式化成修复提示词中的单行描述。"""
+        location = f"行{item.line_no}" if item.line_no else "定位见代码"
+        return (
+            f"{location} [{item.view}/{item.severity.value}] {item.issue_type}："
+            f"{item.description} 建议：{item.suggestion}"
+        )
+
     @staticmethod
     def _parse_json(raw: str) -> dict[str, Any]:
         """容错解析模型输出，返回第一个完整 JSON 对象。

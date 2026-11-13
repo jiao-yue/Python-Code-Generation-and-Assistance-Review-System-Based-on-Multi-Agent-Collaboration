@@ -113,7 +113,7 @@ function setModeUI(mode) {
     testExtra.style.display = "";
   } else {
     chatTitle.textContent = "代码生成";
-    headerSub.textContent = "描述你的需求，智能体将确认需求并生成、审核、测试代码";
+    headerSub.textContent = "描述你的需求，系统会先确认需求；信息不足时先向你提问，再生成、审核、测试";
     mainInput.placeholder = "输入你的需求，Enter 发送，Shift+Enter 换行";
     testExtra.style.display = "none";
   }
@@ -126,6 +126,14 @@ async function send() {
   if (!conv) { await newConversation(); return; }
   const text = mainInput.value.trim();
   if (!text) return;
+
+  // 上一条是待回答的需求澄清卡：先答完问题，避免中途插入新需求
+  const last = conv.messages[conv.messages.length - 1];
+  if (last && last.kind === "question") {
+    const input = document.querySelector(".qa-input");
+    if (input) input.focus();
+    return;
+  }
 
   const mode = conv.mode;
   const testCode = testInput.value.trim();
@@ -162,21 +170,7 @@ async function send() {
       ? { requirement: text, conversation_id: conv.id, title: conv.title }
       : { code: text, test_code: testCode, conversation_id: conv.id, title: conv.title };
 
-    await streamSSE(url, body, (event) => {
-      if (event.type === "stage") {
-        loadingMsg.label = event.label;
-        render();
-      } else if (event.type === "result") {
-        const idx = conv.messages.indexOf(loadingMsg);
-        conv.messages[idx] = { role: "assistant", kind: "result", data: event.data };
-        conv.persisted = true;
-        if (!conv.messages.some((m) => m.kind === "loading")) render();
-      } else if (event.type === "error") {
-        const idx = conv.messages.indexOf(loadingMsg);
-        conv.messages[idx] = { role: "assistant", kind: "error", text: event.message };
-        render();
-      }
-    });
+    await streamSSE(url, body, (event) => applyStreamEvent(event, conv, loadingMsg));
   } catch (err) {
     const idx = conv.messages.indexOf(loadingMsg);
     if (idx !== -1) conv.messages[idx] = { role: "assistant", kind: "error", text: err.message };
@@ -210,6 +204,107 @@ async function apiCall(url, method, payload) {
 const conversationUrl = (id) => "/api/conversations/" + encodeURIComponent(id);
 const apiRename = (id, title) => apiCall(conversationUrl(id), "PATCH", { title });
 const apiDelete = (id) => apiCall(conversationUrl(id), "DELETE");
+
+/* 统一处理流式事件：阶段更新 / 中断提问 / 最终结果 / 错误 */
+function applyStreamEvent(event, conv, loadingMsg) {
+  const idx = conv.messages.indexOf(loadingMsg);
+  if (event.type === "stage") {
+    loadingMsg.label = event.label;
+    render();
+  } else if (event.type === "interrupt") {
+    // 需求存在必须澄清的歧义：把加载占位替换成问题卡，等待用户回答
+    if (idx !== -1) {
+      conv.messages[idx] = {
+        role: "assistant",
+        kind: "question",
+        answered: false,
+        data: {
+          questions: event.questions || [],
+          thread_id: event.thread_id || "",
+        },
+      };
+    }
+    conv.persisted = true;
+    render();
+  } else if (event.type === "result") {
+    // 只有在审核与测试全部跑完后，后端才会推送 result，前端此时才渲染码与报告
+    if (idx !== -1) conv.messages[idx] = { role: "assistant", kind: "result", data: event.data };
+    conv.persisted = true;
+    if (!conv.messages.some((m) => m.kind === "loading")) render();
+  } else if (event.type === "error") {
+    if (idx !== -1) conv.messages[idx] = { role: "assistant", kind: "error", text: event.message };
+    render();
+  }
+}
+
+/* 提交需求澄清回答，并从断点恢复执行 */
+async function submitAnswers(msg) {
+  if (busy) return;
+  const conv = current();
+  if (!conv || !msg) return;
+  const card = messagesEl.querySelector(".qa-card");
+  const inputs = card ? Array.from(card.querySelectorAll(".qa-input")) : [];
+  const answers = [];
+  inputs.forEach((el) => {
+    const text = el.value.trim();
+    if (text) {
+      const question = (msg.data.questions || [])[Number(el.dataset.q)] || "";
+      answers.push({ question, answer: text });
+    }
+  });
+  if (answers.length === 0) {
+    const tip = card && card.querySelector(".qa-tip");
+    if (tip) tip.textContent = "至少填写一条回答后再提交。";
+    return;
+  }
+
+  // 问题卡转为已回答状态，并在对话中留下补充说明
+  msg.answered = true;
+  msg.answers = answers;
+  const answerText = answers
+    .map((a) => (a.question ? `${a.question}：${a.answer}` : a.answer))
+    .join("；");
+  conv.messages.push({ role: "user", kind: "text", text: "补充说明：" + answerText });
+  const loadingMsg = { role: "assistant", kind: "loading", label: "正在生成代码…" };
+  conv.messages.push(loadingMsg);
+  render();
+
+  busy = true;
+  sendBtn.disabled = true;
+  try {
+    const firstUser = conv.messages.find((m) => m.role === "user" && m.kind === "text");
+    await streamSSE(
+      "/api/chat/resume",
+      {
+        conversation_id: conv.id,
+        thread_id: (msg.data && msg.data.thread_id) || "",
+        requirement: firstUser ? firstUser.text : "",
+        title: conv.title,
+        answers,
+      },
+      (event) => applyStreamEvent(event, conv, loadingMsg)
+    );
+  } catch (err) {
+    const idx = conv.messages.indexOf(loadingMsg);
+    if (idx !== -1) conv.messages[idx] = { role: "assistant", kind: "error", text: err.message };
+    render();
+  } finally {
+    busy = false;
+    sendBtn.disabled = false;
+  }
+}
+
+/* 绑定问题卡上的提交按钮（每次渲染后节点都会重建，重新绑定即可） */
+function bindQuestionCards() {
+  messagesEl.querySelectorAll(".qa-submit").forEach((btn) => {
+    btn.onclick = () => {
+      const index = Number(btn.dataset.index);
+      const conv = current();
+      const msg = conv && conv.messages[index];
+      if (msg) submitAnswers(msg);
+    };
+  });
+}
 
 /* 读取 SSE 流：按空行拆分事件，逐条回调 onEvent */
 async function streamSSE(url, body, onEvent) {
@@ -386,7 +481,7 @@ function renderMessages() {
     return;
   }
   messagesEl.innerHTML = "";
-  conv.messages.forEach((m) => {
+  conv.messages.forEach((m, index) => {
     if (m.role === "user") {
       messagesEl.appendChild(row(`<div class="user-bubble">${esc(m.text)}</div>`));
     } else if (m.kind === "loading") {
@@ -397,10 +492,13 @@ function renderMessages() {
       messagesEl.appendChild(row(
         `<div class="a-card" style="color:var(--blocker)">运行出错：${esc(m.text)}</div>`
       ));
+    } else if (m.kind === "question") {
+      messagesEl.appendChild(row(questionCard(m, index, conv.messages.length)));
     } else {
       messagesEl.appendChild(row(renderResult(m.data)));
     }
   });
+  bindQuestionCards();
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
@@ -442,6 +540,37 @@ function buildWelcome() {
     b.onclick = () => { mainInput.value = b.textContent; send(); };
   });
   return div;
+}
+
+/* 需求澄清卡：未回答时可填写；已回答或已翻篇时只读展示 */
+function questionCard(m, index, total) {
+  const data = m.data || {};
+  const questions = data.questions || [];
+  const answered = m.answered || index !== total - 1;
+  if (answered) {
+    const answers = (m.answers || []).map((a) => `
+      <div class="qa-pair">
+        ${a.question ? `<div class="qa-q">${esc(a.question)}</div>` : ""}
+        <div class="qa-a">${esc(a.answer)}</div>
+      </div>`).join("");
+    return `
+    <div class="a-card">
+      <div class="a-card-title">需求澄清 <span class="tag">已回答</span></div>
+      ${answers || `<div class="qa-note">已提交补充说明，继续执行后续流程。</div>`}
+    </div>`;
+  }
+  const fields = questions.map((q, i) => `
+    <div class="qa-field">
+      <div class="qa-q">${esc(q)}</div>
+      <textarea class="qa-input" data-q="${i}" rows="2" placeholder="请填写你的回答…"></textarea>
+    </div>`).join("");
+  return `
+  <div class="a-card qa-card" data-index="${index}">
+    <div class="a-card-title">需求需要确认 <span class="tag">${questions.length} 个问题</span></div>
+    <div class="qa-tip">回答后将继续生成代码，并完成审核与测试；未回答前不会输出代码。</div>
+    ${fields}
+    <div class="qa-actions"><button class="qa-submit" data-index="${index}">提交回答并继续</button></div>
+  </div>`;
 }
 
 /* ---------------- 结果卡片 ---------------- */
@@ -527,6 +656,23 @@ function scorecardBlock(sc) {
   </div>`;
 }
 
+function knowledgeBlock(hits) {
+  if (!hits || !hits.length) return "";
+  const rows = hits.map((h) => `
+    <div class="kb-item">
+      <div class="kb-head">
+        <span class="kb-src">${esc(h.doc)} · ${esc(h.section)}</span>
+        <span class="kb-score">相关度 ${Math.round((h.score || 0) * 100)}%</span>
+      </div>
+      <div class="kb-text">${esc(h.content)}</div>
+    </div>`).join("");
+  return `
+  <details class="kb-hits">
+    <summary>知识库命中 ${hits.length} 条</summary>
+    <div class="kb-list">${rows}</div>
+  </details>`;
+}
+
 function reviewCard(rep) {
   const counts = rep.counts || {};
   const badges = ["阻断", "主要", "次要"]
@@ -553,6 +699,7 @@ function reviewCard(rep) {
       <div class="counts">${badges}</div>
     </div>
     ${scorecardBlock(rep.scorecard)}
+    ${knowledgeBlock(rep.knowledge_hits)}
     ${issues}
     <div style="margin-top:10px;font-size:12.5px;color:var(--text-2)">${esc(rep.summary)}</div>
   </div>`;
@@ -617,7 +764,10 @@ async function checkHealth() {
     const h = await fetchJson("/api/health");
     const prefix = h.mode === "api" ? "真实 API · " : "离线 · ";
     const memory = h.memory === "mysql" ? " · 记忆已持久化" : " · 记忆不可用";
-    document.getElementById("healthText").textContent = prefix + h.model + memory;
+    const rag = h.rag && h.rag.available
+      ? ` · 知识库 ${h.rag.chunks} 条`
+      : " · 知识库不可用";
+    document.getElementById("healthText").textContent = prefix + h.model + memory + rag;
   } catch {
     document.getElementById("healthText").textContent = "后端未连接";
   }

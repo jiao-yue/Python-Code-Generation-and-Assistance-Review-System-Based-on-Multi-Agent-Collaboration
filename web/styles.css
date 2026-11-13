@@ -324,6 +324,41 @@ pre.code {
 .send-btn:hover { background: var(--accent-dark); }
 .send-btn:disabled { background: #c3c7d0; cursor: not-allowed; }
 
+/* 需求澄清卡：问题输入与提交按钮，沿用卡片与强调色，不改变整体风格 */
+.qa-tip { font-size: 12.5px; color: var(--text-2); margin-bottom: 10px; }
+.qa-field { margin-bottom: 10px; }
+.qa-q { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+.qa-input {
+  width: 100%; border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 10px; font-family: inherit; font-size: 13px;
+  color: var(--text); background: #fafafb; outline: none; resize: vertical;
+}
+.qa-input:focus { border-color: var(--accent); background: #fff; }
+.qa-actions { display: flex; justify-content: flex-end; margin-top: 4px; }
+.qa-submit {
+  padding: 7px 16px; border-radius: 9px; border: none;
+  background: var(--accent); color: #fff; cursor: pointer;
+  font-size: 12.5px; font-weight: 600;
+}
+.qa-submit:hover { background: var(--accent-dark); }
+.qa-pair { margin-bottom: 8px; }
+.qa-a { font-size: 12.5px; color: var(--text-2); line-height: 1.6; }
+.qa-note { font-size: 12.5px; color: var(--text-2); }
+
+/* 知识库命中：折叠块 + 来源与相关度，沿用卡片体系，不引入新配色 */
+.kb-hits { margin-top: 12px; border-top: 1px dashed var(--border); padding-top: 10px; }
+.kb-hits summary {
+  font-size: 12.5px; color: var(--text-2); cursor: pointer; list-style: none;
+}
+.kb-hits summary::before { content: "▸ "; }
+.kb-hits[open] summary::before { content: "▾ "; }
+.kb-list { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }
+.kb-item { background: #f7f8fa; border-radius: 8px; padding: 8px 10px; }
+.kb-head { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 4px; }
+.kb-src { font-size: 12px; font-weight: 600; color: var(--text); }
+.kb-score { font-size: 11px; color: var(--text-2); flex-shrink: 0; }
+.kb-text { font-size: 12px; line-height: 1.6; color: var(--text-2); }
+
 /* 滚动条 */
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-thumb { background: #d2d5dd; border-radius: 8px; }

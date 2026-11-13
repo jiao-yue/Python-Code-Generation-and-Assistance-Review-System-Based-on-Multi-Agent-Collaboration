@@ -36,10 +36,16 @@ class ChatWorkspace:
         self.test_path = self.dir / "test_solution.py"
 
     def write_files(self, solution_code: str, test_code: str = "") -> None:
-        """把实现代码与测试代码写入工程目录（UTF-8）。"""
+        """把实现代码与测试代码写入工程目录（UTF-8）。
+
+        同一轮修复会复用 run_id 目录；如果本次没有测试代码，必须删除上一版留下的
+        test_solution.py，否则 pytest 会把旧测试当成新测试执行。
+        """
         self.solution_path.write_text(solution_code, encoding="utf-8")
-        if test_code:  # 没有测试代码时不生成测试文件
+        if test_code:
             self.test_path.write_text(test_code, encoding="utf-8")
+        else:
+            self.test_path.unlink(missing_ok=True)
 
     def run_static(self) -> list[CodeReviewItem]:
         """运行 Ruff/Bandit/ast，并把工具发现统一转成 CodeReviewItem。"""

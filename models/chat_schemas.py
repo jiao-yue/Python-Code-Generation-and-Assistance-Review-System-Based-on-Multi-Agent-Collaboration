@@ -85,6 +85,17 @@ class ReviewScorecard(BaseModel):
     )
 
 
+class RagHit(BaseModel):
+    """知识库检索命中的单个片段（带来源，便于前端展示与人工复核）。"""
+
+    chunk_id: str = Field(description="片段编号，形如 security#2")
+    doc: str = Field(description="来源文档文件名（不含扩展名）")
+    doc_title: str = Field(default="", description="来源文档标题")
+    section: str = Field(default="", description="片段所属小节标题")
+    content: str = Field(default="", description="片段正文")
+    score: float = Field(default=0.0, description="与查询的余弦相似度，0~1")
+
+
 class CodeReviewReport(BaseModel):
     """代码审核汇总（三视角 + 结论 + 确定性评分卡）。"""
 
@@ -94,6 +105,9 @@ class CodeReviewReport(BaseModel):
     summary: str = Field(default="", description="结论摘要")
     counts: dict[str, int] = Field(default_factory=dict, description="各严重等级计数")
     scorecard: ReviewScorecard | None = Field(default=None, description="EEC 风格确定性评分卡")
+    knowledge_hits: list[RagHit] = Field(
+        default_factory=list, description="本次审核从知识库检索命中的规范片段"
+    )
 
 
 # ---------------------------------------------------------------------------

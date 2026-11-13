@@ -33,6 +33,8 @@ class TestRunner:
         """
         project_dir = Path(project_dir)
         junit_path = project_dir / "junit_report.xml"
+        # 同一轮修复会复用目录；先删掉上一轮报告，避免 pytest 异常退出时读到旧结果
+        junit_path.unlink(missing_ok=True)
         cmd = [
             sys.executable,
             "-m",

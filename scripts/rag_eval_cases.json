@@ -1,0 +1,82 @@
+[
+  {
+    "query": "求平均值时没有判断空列表和除数为零",
+    "expected": ["logic_boundary#2", "logic_boundary#1"]
+  },
+  {
+    "query": "函数参数默认值写成可变列表 [] 会有什么问题",
+    "expected": ["logic_boundary#4"]
+  },
+  {
+    "query": "捕获所有异常但不做任何处理，裸 except",
+    "expected": ["logic_boundary#5"]
+  },
+  {
+    "query": "用 eval 执行用户传入的表达式",
+    "expected": ["security#1"]
+  },
+  {
+    "query": "用 pickle.loads 反序列化外部数据",
+    "expected": ["security#3"]
+  },
+  {
+    "query": "API Key 和数据库口令硬编码在源码里",
+    "expected": ["security#4"]
+  },
+  {
+    "query": "requests 请求没有设置超时时间",
+    "expected": ["security#6"]
+  },
+  {
+    "query": "函数和变量命名太短，完全看不出意图",
+    "expected": ["python_style#1"]
+  },
+  {
+    "query": "公开函数没有写类型注解和返回类型",
+    "expected": ["python_style#5"]
+  },
+  {
+    "query": "pytest 只断言结果不为 None，断言太弱",
+    "expected": ["testing#3"]
+  },
+  {
+    "query": "测试依赖当前时间和执行顺序，结果不稳定",
+    "expected": ["testing#4"]
+  },
+  {
+    "query": "生成的文件必须叫 solution.py 和 test_solution.py",
+    "expected": ["project_conventions#3"]
+  },
+  {
+    "query": "修复问题时不要顺手重构无关代码，保持最小 diff",
+    "expected": ["project_conventions#5"]
+  },
+  {
+    "query": "SQL 查询把用户输入直接拼进语句",
+    "expected": ["security_review_cases#3"]
+  },
+  {
+    "query": "代码评审应该优先看设计还是命名风格",
+    "expected": ["code_review_cases#2"]
+  },
+  {
+    "query": "输入校验用黑名单过滤危险字符是否足够",
+    "expected": ["security_review_cases#2"]
+  },
+  {
+    "query": "函数嵌套太深、参数太多，是否属于过度设计",
+    "expected": ["code_review_cases#5"]
+  },
+  {
+    "query": "测试写得很复杂，但根本不能在实现出错时失败",
+    "expected": ["code_review_cases#6", "testing#3"]
+  },
+  {
+    "query": "多线程共享可变状态需要加锁还是改成不可变数据",
+    "expected": ["logic_boundary#6", "code_review_cases#4"]
+  },
+  {
+    "query": "注释应该解释为什么而不是复述代码做了什么",
+    "expected": ["python_style#3"]
+  }
+]

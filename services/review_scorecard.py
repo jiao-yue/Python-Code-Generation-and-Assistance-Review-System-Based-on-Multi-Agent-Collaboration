@@ -51,7 +51,9 @@ def filter_low_confidence(items: list[CodeReviewItem]) -> list[CodeReviewItem]:
     - source == "llm"：仅当置信度达到阈值才保留。
     """
     return [
-        item for item in items if item.source == "tool" or item.confidence >= CONFIDENCE_THRESHOLD
+        item
+        for item in items
+        if item.source in {"tool", "test"} or item.confidence >= CONFIDENCE_THRESHOLD
     ]
 
 

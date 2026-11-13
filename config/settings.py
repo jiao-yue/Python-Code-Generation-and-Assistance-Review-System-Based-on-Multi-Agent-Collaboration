@@ -29,8 +29,12 @@ GENERATED_DIR: Path = STORAGE_DIR / "generated"  # 每次运行的独立 Python 
 LOGS_DIR: Path = STORAGE_DIR / "logs"
 RESULTS_DIR: Path = STORAGE_DIR / "results"
 
+# 审核知识库（随代码提交）与向量索引（运行期产物，自动重建）
+KNOWLEDGE_DIR: Path = BASE_DIR / "knowledge"
+RAG_DIR: Path = STORAGE_DIR / "rag"
+
 # 自动创建运行期目录，避免后续写文件时因目录不存在而报错
-for _directory in (STORAGE_DIR, GENERATED_DIR, LOGS_DIR, RESULTS_DIR):
+for _directory in (STORAGE_DIR, GENERATED_DIR, LOGS_DIR, RESULTS_DIR, RAG_DIR):
     _directory.mkdir(parents=True, exist_ok=True)
 
 # 加载根目录 .env（包含 DeepSeek / 火山方舟的 API Key）
@@ -75,7 +79,7 @@ def get_llm_endpoint() -> tuple[str, str, str]:
 DB_HOST: str = os.getenv("DB_HOST", "localhost")
 DB_PORT: int = int(os.getenv("DB_PORT", "3306"))
 DB_USER: str = os.getenv("DB_USER", "root")
-DB_PASSWORD: str = os.getenv("DB_PASSWORD", "123456")
+DB_PASSWORD: str = os.getenv("DB_PASSWORD", "")
 # 库名含空格，SQL 中必须使用反引号：`graduation project`
 DB_NAME: str = os.getenv("DB_NAME", "graduation project")
 DB_CHARSET: str = "utf8mb4"
@@ -86,3 +90,18 @@ DB_CHARSET: str = "utf8mb4"
 # ---------------------------------------------------------------------------
 MAX_ROUNDS: int = int(os.getenv("MAX_ROUNDS", "3"))  # 最大修复轮次
 PYTEST_TIMEOUT: int = int(os.getenv("PYTEST_TIMEOUT", "120"))  # pytest 子进程超时（秒）
+
+
+# ---------------------------------------------------------------------------
+# RAG 检索配置（Chroma 向量库）
+# ---------------------------------------------------------------------------
+RAG_COLLECTION: str = os.getenv("RAG_COLLECTION", "code_review_kb")
+RAG_EMBED_DIM: int = int(os.getenv("RAG_EMBED_DIM", "512"))  # 本地哈希向量维度
+RAG_TOP_K: int = int(os.getenv("RAG_TOP_K", "4"))  # 审核时最多注入的片段数
+RAG_GENERATE_TOP_K: int = int(os.getenv("RAG_GENERATE_TOP_K", "3"))  # 生成时最多注入的片段数
+RAG_MIN_SCORE: float = float(os.getenv("RAG_MIN_SCORE", "0.08"))  # 低于该相关度的片段丢弃
+RAG_MAX_CHUNK_CHARS: int = int(os.getenv("RAG_MAX_CHUNK_CHARS", "600"))  # 单片注入上限
+# 查询扩展：一次检索最多使用几个查询变体（原始查询 + 同义词扩展）
+RAG_QUERY_VARIANTS: int = int(os.getenv("RAG_QUERY_VARIANTS", "2"))
+# MMR 多样性重排：1.0 只看相关度，越小越强调片段之间的差异
+RAG_MMR_LAMBDA: float = float(os.getenv("RAG_MMR_LAMBDA", "0.85"))

@@ -37,9 +37,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from config import settings
-from graph.chat_graph import stream_chat_pipeline
+from graph.chat_graph import has_pending_clarification, new_thread_id, stream_chat_pipeline
 from models.chat_schemas import ChatPipelineResult
 from services.chat_memory import chat_memory
+from services.rag_retriever import rag_retriever
 
 # 项目根目录（本文件在 <root>/api/server.py，向上一级即根）
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -79,6 +80,23 @@ class CreateConversationRequest(BaseModel):
     conversation_id: str  # 前端生成的会话编号
     mode: str = "generate"  # 模式：generate / review
     title: str = ""  # 初始标题（为空则后端给默认标题）
+
+
+class AnswerItem(BaseModel):
+    """用户对一条澄清问题的回答。"""
+
+    question: str = ""
+    answer: str
+
+
+class ChatResumeRequest(BaseModel):
+    """POST /api/chat/resume 的请求体：提交补充回答并恢复被中断的执行。"""
+
+    conversation_id: str
+    thread_id: str = ""  # 中断事件返回的 thread_id
+    requirement: str = ""  # 原始需求（检查点丢失时用于重新执行）
+    title: str = ""
+    answers: list[AnswerItem] = []
 
 
 # ===========================================================================
@@ -125,8 +143,17 @@ def chat_event_stream(
     pasted_code: str,
     pasted_test: str,
     persist_title: str,
+    thread_id: str = "",
+    answers: list[dict[str, str]] | None = None,
+    skip_interrupt: bool = False,
+    result_only: bool = False,
 ) -> Iterator[str]:
-    """执行图并逐段 yield SSE 文本。"""
+    """执行图并逐段 yield SSE 文本。
+
+    :param answers: 用户补充回答；不为 None 时从中断点恢复执行
+    :param skip_interrupt: 恢复执行时不再重复中断（问题已经回答过）
+    :param result_only: 只写助手结果，不重复写用户原始需求（恢复场景使用）
+    """
     try:
         final_payload: dict[str, Any] | None = None
         for event in stream_chat_pipeline(
@@ -134,7 +161,32 @@ def chat_event_stream(
             raw_requirement=raw_requirement,
             pasted_code=pasted_code,
             pasted_test=pasted_test,
+            thread_id=thread_id,
+            answers=answers,
+            skip_interrupt=skip_interrupt,
         ):
+            if event["type"] == "interrupt":
+                # 需求存在必须澄清的歧义：保存问题卡片并结束本次流，等待用户回答
+                value = event.get("value") or {}
+                questions = list(value.get("questions", []))
+                turn_no = _next_turn_no(conversation_id)
+                chat_memory.save_clarification(
+                    conversation_id=conversation_id,
+                    mode=mode,
+                    user_text=raw_requirement,
+                    payload={"questions": questions, "thread_id": event.get("thread_id", "")},
+                    turn_no=turn_no,
+                    title=persist_title,
+                )
+                yield _sse_line(
+                    {
+                        "type": "interrupt",
+                        "conversation_id": conversation_id,
+                        "thread_id": event.get("thread_id", ""),
+                        "questions": questions,
+                    }
+                )
+                return
             if event["type"] == "stage":
                 # 阶段事件：只把前端需要的字段透传
                 yield _sse_line(
@@ -150,14 +202,19 @@ def chat_event_stream(
                 # 最终状态：序列化后持久化，并作为结果事件推送
                 final_payload = serialize_chat(event["state"])
                 turn_no = _next_turn_no(conversation_id)
-                chat_memory.save_result(
-                    conversation_id=conversation_id,
-                    mode=mode,
-                    user_text=raw_requirement,
-                    result=final_payload,
-                    turn_no=turn_no,
-                    title=persist_title,
-                )
+                if result_only:
+                    chat_memory.save_assistant_result(
+                        conversation_id, final_payload, turn_no, persist_title
+                    )
+                else:
+                    chat_memory.save_result(
+                        conversation_id=conversation_id,
+                        mode=mode,
+                        user_text=raw_requirement,
+                        result=final_payload,
+                        turn_no=turn_no,
+                        title=persist_title,
+                    )
                 yield _sse_line(
                     {
                         "type": "result",
@@ -171,12 +228,21 @@ def chat_event_stream(
         message = f"{type(exc).__name__}: {exc}"
         # 记忆失败不应影响错误事件的返回，用 suppress 显式忽略记忆层异常
         with contextlib.suppress(Exception):
-            chat_memory.save_error(
-                conversation_id,
-                raw_requirement,
-                message,
-                _next_turn_no(conversation_id),
-            )
+            if result_only:
+                chat_memory.add_message(
+                    conversation_id,
+                    "assistant",
+                    "error",
+                    message,
+                    _next_turn_no(conversation_id),
+                )
+            else:
+                chat_memory.save_error(
+                    conversation_id,
+                    raw_requirement,
+                    message,
+                    _next_turn_no(conversation_id),
+                )
         yield _sse_line({"type": "error", "message": message})
 
 
@@ -198,9 +264,13 @@ app.add_middleware(
 # ===========================================================================
 @app.get("/api/health")
 def health() -> dict[str, Any]:
-    """健康检查：返回模型提供方、模型名、运行模式与持久记忆状态。"""
+    """健康检查：返回模型提供方、模型名、运行模式、持久记忆与知识库状态。"""
     api_key, _base, model = settings.get_llm_endpoint()
     mode = "mock" if (settings.FORCE_MOCK or not api_key) else "api"
+    # 首次调用时确保向量索引已建好，让前端能展示“知识库 N 条”
+    rag_available = rag_retriever.ensure_index()
+    rag_stats = rag_retriever.stats()
+    rag_stats["available"] = rag_available
     return {
         "status": "ok",
         "provider": settings.LLM_PROVIDER,
@@ -208,6 +278,7 @@ def health() -> dict[str, Any]:
         "mode": mode,
         "max_rounds": settings.MAX_ROUNDS,
         "memory": "mysql" if chat_memory.available else "unavailable",
+        "rag": rag_stats,
     }
 
 
@@ -283,6 +354,7 @@ def chat_generate(req: ChatGenerateRequest) -> StreamingResponse:
             pasted_code="",
             pasted_test="",
             persist_title=title,
+            thread_id=new_thread_id(conversation_id),
         ),
         media_type="text/event-stream",
     )
@@ -305,6 +377,78 @@ def chat_review(req: ChatReviewRequest) -> StreamingResponse:
             pasted_code=req.code,
             pasted_test=req.test_code,
             persist_title=review_title,
+            thread_id=new_thread_id(conversation_id),
+        ),
+        media_type="text/event-stream",
+    )
+
+
+@app.post("/api/chat/resume")
+def chat_resume(req: ChatResumeRequest) -> StreamingResponse:
+    """提交需求澄清回答，恢复此前被中断的生成流程（SSE 流式）。"""
+    answers = [item for item in req.answers if item.answer.strip()]
+    if not answers:
+        raise HTTPException(status_code=400, detail="补充回答不能为空")
+    conversation = chat_memory.get_conversation(req.conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="会话不存在或数据库不可用")
+
+    # 原始需求优先取请求体；否则回退到会话里的第一条用户消息
+    requirement = req.requirement.strip() or next(
+        (
+            message.get("text", "")
+            for message in conversation["messages"]
+            if message.get("role") == "user" and message.get("kind") == "text"
+        ),
+        "按已确认需求继续",
+    )
+    title = req.title.strip() or conversation["title"]
+    answer_text = "；".join(
+        f"{item.question.strip()}：{item.answer.strip()}"
+        if item.question.strip()
+        else item.answer.strip()
+        for item in answers
+    )
+    chat_memory.save_answer(req.conversation_id, answer_text, _next_turn_no(req.conversation_id))
+    payload = [
+        {"question": item.question.strip(), "answer": item.answer.strip()} for item in answers
+    ]
+
+    if req.thread_id and has_pending_clarification(req.thread_id):
+        # 正常恢复：从断点继续，不重复写入用户原始需求
+        return StreamingResponse(
+            chat_event_stream(
+                mode="generate",
+                conversation_id=req.conversation_id,
+                raw_requirement=requirement,
+                pasted_code="",
+                pasted_test="",
+                persist_title=title,
+                thread_id=req.thread_id,
+                answers=payload,
+                skip_interrupt=True,
+                result_only=True,
+            ),
+            media_type="text/event-stream",
+        )
+
+    # 检查点丢失（如服务重启）：把回答并入需求后重新执行，并跳过再次中断
+    merged_requirement = f"{requirement}\n\n补充说明：\n" + "\n".join(
+        f"- {item.question.strip()}：{item.answer.strip()}"
+        if item.question.strip()
+        else f"- {item.answer.strip()}"
+        for item in answers
+    )
+    return StreamingResponse(
+        chat_event_stream(
+            mode="generate",
+            conversation_id=req.conversation_id,
+            raw_requirement=merged_requirement,
+            pasted_code="",
+            pasted_test="",
+            persist_title=title,
+            skip_interrupt=True,
+            result_only=True,
         ),
         media_type="text/event-stream",
     )
