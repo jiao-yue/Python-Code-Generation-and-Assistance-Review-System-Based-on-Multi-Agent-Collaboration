@@ -3,6 +3,7 @@
    状态：新建对话即落库（刷新不丢失），会话与每轮结果由后端持久化（MySQL）
    接口：POST /api/conversations 新建即持久化；GET /api/conversations(+id) 读取历史；
          PATCH /api/conversations/{id} 自定义命名；DELETE /api/conversations/{id} 删除并重排编号；
+         POST /api/uploads 上传附件并按 MD5 去重，可仅用于对话或导入 RAG；
          POST /api/chat/generate（代码生成）/ POST /api/chat/review（仅审核），均为 SSE 流式
    说明：历史项支持悬停重命名与删除，消息编号在删除后重排为连续序号，不引入图片/logo
    ========================================================================== */
@@ -13,6 +14,9 @@ let conversations = [];                 // 会话列表（部分可能尚未加�
 let currentId = null;                   // 当前会话 ID
 let busy = false;                       // 是否正在请求
 let editingId = null;                   // 正在重命名的会话 ID（同时只有一个）
+let uploading = false;                  // 是否正在上传/解析附件
+let pendingAttachments = [];            // 待发送消息携带的附件（知识库上传不加入）
+let uploadPurpose = "chat";             // chat：当前对话；knowledge：导入 RAG
 
 /* ---------------- DOM 引用 ---------------- */
 const messagesEl = document.getElementById("messages");
@@ -23,6 +27,11 @@ const sendBtn = document.getElementById("sendBtn");
 const historyList = document.getElementById("historyList");
 const chatTitle = document.getElementById("chatTitle");
 const headerSub = document.getElementById("headerSub");
+const fileInput = document.getElementById("fileInput");
+const attachBtn = document.getElementById("attachBtn");
+const knowledgeBtn = document.getElementById("knowledgeBtn");
+const attachmentList = document.getElementById("attachmentList");
+const uploadStatus = document.getElementById("uploadStatus");
 
 /* ============================== 工具函数 ============================== */
 function esc(s) {
@@ -30,6 +39,100 @@ function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => (
     { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
   ));
+}
+
+/* ============================== 附件上传 ============================== */
+function updateSendState() {
+  // 上传期间不允许发送，避免请求漏带尚未解析完成的附件。
+  sendBtn.disabled = busy || uploading;
+  attachBtn.disabled = busy || uploading;
+  knowledgeBtn.disabled = busy || uploading;
+}
+
+function renderAttachments() {
+  attachmentList.replaceChildren();
+  attachmentList.hidden = pendingAttachments.length === 0;
+  pendingAttachments.forEach((attachment) => {
+    const chip = document.createElement("span");
+    chip.className = "attachment-chip";
+    const label = document.createElement("span");
+    label.textContent = attachment.filename + (attachment.in_knowledge ? "（已入库）" : "");
+    label.title = attachment.filename;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "attachment-remove";
+    remove.textContent = "×";
+    remove.title = "移除此附件（不会删除知识库）";
+    remove.disabled = busy || uploading;
+    remove.onclick = () => {
+      pendingAttachments = pendingAttachments.filter((item) => item.id !== attachment.id);
+      renderAttachments();
+    };
+    chip.append(label, remove);
+    attachmentList.appendChild(chip);
+  });
+  updateSendState();
+}
+
+function clearPendingAttachments() {
+  pendingAttachments = [];
+  uploadStatus.textContent = "";
+  uploadStatus.classList.remove("error");
+  renderAttachments();
+}
+
+async function uploadFiles(files, purpose) {
+  if (!files.length || uploading || busy) return;
+  uploading = true;
+  uploadStatus.classList.remove("error");
+  uploadStatus.textContent = purpose === "knowledge" ? "正在解析并导入知识库…" : "正在解析附件…";
+  updateSendState();
+
+  const form = new FormData();
+  files.forEach((file) => form.append("files", file, file.name));
+  form.append("import_to_knowledge", purpose === "knowledge" ? "true" : "false");
+  try {
+    const response = await fetch("/api/uploads", { method: "POST", body: form });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.detail || `上传失败（${response.status}）`);
+
+    const results = body.results || [];
+    const errors = results.filter((item) => item.status === "error");
+    let added = 0;
+    if (purpose === "chat") {
+      results.forEach((item) => {
+        if (item.status === "error" || !item.attachment) return;
+        const attachment = item.attachment;
+        if (!pendingAttachments.some((existing) => existing.id === attachment.id)) {
+          pendingAttachments.push({
+            id: attachment.id,
+            filename: attachment.filename,
+            in_knowledge: attachment.in_knowledge,
+          });
+          added += 1;
+        }
+      });
+      renderAttachments();
+      uploadStatus.textContent = `已准备 ${added} 个附件，可随下一条消息发送`;
+    } else {
+      const imported = results.filter((item) => item.knowledge_changed).length;
+      const duplicated = results.filter((item) => item.status === "duplicate").length;
+      uploadStatus.textContent = `知识库处理完成：新增 ${imported} 个，MD5 重复 ${duplicated} 个`;
+      if (imported > 0) await checkHealth();
+    }
+    if (body.index_refreshed === false) uploadStatus.textContent += "；索引刷新失败，可重试";
+    if (errors.length) {
+      uploadStatus.textContent += "；" + errors.map((item) => `${item.filename}：${item.message}`).join("；");
+      uploadStatus.classList.add("error");
+    }
+  } catch (error) {
+    uploadStatus.textContent = error.message;
+    uploadStatus.classList.add("error");
+  } finally {
+    uploading = false;
+    fileInput.value = ""; // 允许再次选择同一个文件，由后端 MD5 去重
+    updateSendState();
+  }
 }
 
 function current() {
@@ -54,6 +157,7 @@ async function newConversation(mode) {
   };
   conversations.unshift(conv);
   currentId = conv.id;
+  clearPendingAttachments();
   setModeUI(m);
   render();
   mainInput.focus();
@@ -74,6 +178,7 @@ async function newConversation(mode) {
 
 async function selectConversation(id) {
   currentId = id;
+  clearPendingAttachments();
   const conv = current();
   if (!conv) return;
   // 列表里只有元信息，第一次打开时拉取完整消息
@@ -108,24 +213,25 @@ function setModeUI(mode) {
   });
   if (mode === "review") {
     chatTitle.textContent = "只审核代码";
-    headerSub.textContent = "粘贴已有代码，智能体只做审核与测试，不生成代码";
-    mainInput.placeholder = "粘贴需要审核的 Python 代码…";
+    headerSub.textContent = "粘贴代码或添加代码附件，智能体只做审核与测试，不生成代码";
+    mainInput.placeholder = "粘贴需要审核的 Python 代码，或直接添加代码附件…";
     testExtra.style.display = "";
   } else {
     chatTitle.textContent = "代码生成";
-    headerSub.textContent = "描述你的需求，系统会先确认需求；信息不足时先向你提问，再生成、审核、测试";
-    mainInput.placeholder = "输入你的需求，Enter 发送，Shift+Enter 换行";
+    headerSub.textContent = "描述需求或添加需求附件；信息不足时先提问，再生成、审核、测试";
+    mainInput.placeholder = "输入需求，或添加 Word、Excel、PDF、图片等需求附件…";
     testExtra.style.display = "none";
   }
 }
 
 /* ============================== 发送与流式请求 ============================== */
 async function send() {
-  if (busy) return;
+  if (busy || uploading) return;
   const conv = current();
   if (!conv) { await newConversation(); return; }
   const text = mainInput.value.trim();
-  if (!text) return;
+  const attachments = [...pendingAttachments];
+  if (!text && attachments.length === 0) return;
 
   // 上一条是待回答的需求澄清卡：先答完问题，避免中途插入新需求
   const last = conv.messages[conv.messages.length - 1];
@@ -139,13 +245,15 @@ async function send() {
   const testCode = testInput.value.trim();
   // 发送前还没有任何消息，说明是这个会话的第一轮
   const isFirstTurn = conv.messages.length === 0;
+  const attachmentNote = attachments.length
+    ? `\n附件：${attachments.map((item) => item.filename).join("、")}`
+    : "";
 
-  // 1) 追加用户消息（审核模式沿用简短文案，避免把整段代码写进气泡）
-  conv.messages.push({
-    role: "user",
-    kind: "text",
-    text: mode === "review" ? (testCode ? "审核一段代码（含测试）" : "审核一段代码") : text,
-  });
+  // 1) 追加用户消息；附件只显示文件名，正文由后端按 ID 读取。
+  const userText = mode === "review"
+    ? (testCode ? "审核一段代码（含测试）" : "审核一段代码")
+    : (text || "根据附件内容实现需求");
+  conv.messages.push({ role: "user", kind: "text", text: userText + attachmentNote });
   // 2) 追加加载占位，label 会随阶段事件实时更新
   const loadingMsg = {
     role: "assistant",
@@ -155,20 +263,25 @@ async function send() {
   conv.messages.push(loadingMsg);
   mainInput.value = "";
   testInput.value = "";
+  pendingAttachments = [];
+  renderAttachments();
   autoResize();
   render();
 
   busy = true;
-  sendBtn.disabled = true;
+  updateSendState();
   try {
     // 第一轮且用户未手动命名时自动给标题；之后保持不变，不覆盖自定义标题
     if (isFirstTurn && !conv.customTitle) {
-      conv.title = mode === "review" ? "代码审核" : text.slice(0, 18);
+      conv.title = mode === "review"
+        ? "代码审核"
+        : (text.slice(0, 18) || attachments[0].filename.slice(0, 18));
     }
     const url = mode === "generate" ? "/api/chat/generate" : "/api/chat/review";
+    const attachmentIds = attachments.map((item) => item.id);
     const body = mode === "generate"
-      ? { requirement: text, conversation_id: conv.id, title: conv.title }
-      : { code: text, test_code: testCode, conversation_id: conv.id, title: conv.title };
+      ? { requirement: text, conversation_id: conv.id, title: conv.title, attachment_ids: attachmentIds }
+      : { code: text, test_code: testCode, conversation_id: conv.id, title: conv.title, attachment_ids: attachmentIds };
 
     await streamSSE(url, body, (event) => applyStreamEvent(event, conv, loadingMsg));
   } catch (err) {
@@ -177,7 +290,7 @@ async function send() {
     render();
   } finally {
     busy = false;
-    sendBtn.disabled = false;
+    updateSendState();
   }
 }
 
@@ -270,7 +383,7 @@ async function submitAnswers(msg) {
   render();
 
   busy = true;
-  sendBtn.disabled = true;
+  updateSendState();
   try {
     const firstUser = conv.messages.find((m) => m.role === "user" && m.kind === "text");
     await streamSSE(
@@ -290,7 +403,7 @@ async function submitAnswers(msg) {
     render();
   } finally {
     busy = false;
-    sendBtn.disabled = false;
+    updateSendState();
   }
 }
 
@@ -730,6 +843,18 @@ function pytestCard(p) {
 /* ============================== 事件绑定 ============================== */
 sendBtn.onclick = send;
 document.getElementById("newChatBtn").onclick = () => newConversation();
+attachBtn.onclick = () => {
+  uploadPurpose = "chat";
+  fileInput.click();
+};
+knowledgeBtn.onclick = () => {
+  uploadPurpose = "knowledge";
+  fileInput.click();
+};
+fileInput.addEventListener("change", () => {
+  const files = Array.from(fileInput.files || []);
+  uploadFiles(files, uploadPurpose);
+});
 document.querySelectorAll(".mode-btn").forEach((b) => {
   b.onclick = () => setMode(b.dataset.mode);
 });

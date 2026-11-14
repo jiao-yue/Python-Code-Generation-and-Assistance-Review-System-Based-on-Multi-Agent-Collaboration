@@ -320,9 +320,39 @@ pre.code {
   background: var(--accent); color: #fff; cursor: pointer;
   font-size: 13px; font-weight: 600;
   transition: background .15s;
+  white-space: nowrap; flex-shrink: 0;
 }
 .send-btn:hover { background: var(--accent-dark); }
 .send-btn:disabled { background: #c3c7d0; cursor: not-allowed; }
+
+/* 附件上传：沿用现有边框、卡片与强调色，不增加图标或 Logo */
+.composer-left { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.upload-btn {
+  padding: 5px 9px; border: 1px solid var(--border); border-radius: 8px;
+  background: transparent; color: var(--text-2); cursor: pointer;
+  font-family: inherit; font-size: 12px;
+  white-space: nowrap; flex-shrink: 0;
+}
+.upload-btn:hover { color: var(--accent); border-color: var(--accent); }
+.upload-btn:disabled { opacity: .5; cursor: not-allowed; }
+.attachment-list { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.attachment-chip {
+  display: inline-flex; align-items: center; gap: 5px; max-width: 100%;
+  padding: 5px 8px; border: 1px solid var(--border); border-radius: 8px;
+  background: #f7f8fa; color: var(--text-2); font-size: 12px;
+}
+.attachment-chip > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attachment-remove {
+  border: none; background: transparent; color: var(--text-2);
+  cursor: pointer; padding: 0 2px; font-size: 15px; line-height: 1;
+}
+.attachment-remove:hover { color: var(--accent); }
+.upload-status { margin-top: 6px; color: var(--text-2); font-size: 11px; line-height: 1.5; }
+.upload-status:empty { display: none; }
+.upload-status.error { color: #b42318; }
+@media (max-width: 720px) {
+  .composer-hint { display: none; }
+}
 
 /* 需求澄清卡：问题输入与提交按钮，沿用卡片与强调色，不改变整体风格 */
 .qa-tip { font-size: 12.5px; color: var(--text-2); margin-bottom: 10px; }

@@ -7,7 +7,7 @@
   <!-- 声明无站点图标，避免浏览器自动请求 favicon.ico 产生 404，且不引入任何图片 -->
   <link rel="icon" href="data:," />
   <!-- 带版本号，强制浏览器加载最新样式，避免外部浏览器缓存导致页面无样式 -->
-  <link rel="stylesheet" href="/static/styles.css?v=8" />
+  <link rel="stylesheet" href="/static/styles.css?v=9" />
 </head>
 <body>
   <div class="app">
@@ -64,8 +64,11 @@
       <!-- ============ 底部输入区 ============ -->
       <footer class="composer">
         <div class="composer-box">
+          <div id="attachmentList" class="attachment-list" hidden></div>
           <textarea id="mainInput" rows="1"
-            placeholder="输入你的需求，Enter 发送，Shift+Enter 换行"></textarea>
+            placeholder="输入需求或粘贴代码，也可以添加 Word、Excel、PDF、图片或代码附件"></textarea>
+          <input id="fileInput" type="file" multiple hidden
+            accept=".docx,.xlsx,.xls,.pdf,.png,.jpg,.jpeg,.bmp,.webp,.tif,.tiff,.txt,.py,.md,.csv,.json,.log">
 
           <!-- 仅审核模式：可选测试代码 -->
           <details class="test-extra" id="testExtra">
@@ -75,15 +78,20 @@
           </details>
 
           <div class="composer-bar">
-            <span class="composer-hint" id="composerHint">LLM 需求确认 · 代码生成 · 静态审核 · pytest</span>
+            <div class="composer-left">
+              <button id="attachBtn" class="upload-btn" type="button">添加附件</button>
+              <button id="knowledgeBtn" class="upload-btn" type="button">导入知识库</button>
+              <span class="composer-hint" id="composerHint">最多 5 个附件，单文件 20 MB</span>
+            </div>
             <!-- 纯文字发送按钮，不使用图标 -->
             <button class="send-btn" id="sendBtn" title="发送">发送</button>
           </div>
+          <div id="uploadStatus" class="upload-status" aria-live="polite"></div>
         </div>
       </footer>
     </main>
   </div>
 
-  <script src="/static/app.js?v=8"></script>
+  <script src="/static/app.js?v=9"></script>
 </body>
 </html>
