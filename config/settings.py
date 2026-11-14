@@ -45,12 +45,14 @@ load_dotenv(BASE_DIR / ".env")
 
 
 # ---------------------------------------------------------------------------
-# 大模型配置（DeepSeek / 火山方舟，均为 OpenAI 兼容接口）
+# 大模型配置（DeepSeek / 火山方舟 / Ollama 本地模型 / 内置 Mock）
 # ---------------------------------------------------------------------------
-LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "deepseek").lower()  # deepseek / doubao / mock
+LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "deepseek").lower()
+# 可选值：deepseek / doubao / ollama / mock
 LLM_MODEL: str = os.getenv("LLM_MODEL", "deepseek-chat")
 LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.0"))  # 固定温度，结果可复现
-LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "2048"))
+# 默认 8192：代码/网页类长输出在 2048 时容易被截断成不完整 JSON。
+LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "8192"))
 LLM_TIMEOUT: int = int(os.getenv("LLM_TIMEOUT", "60"))
 LLM_MAX_RETRIES: int = int(os.getenv("LLM_MAX_RETRIES", "3"))  # JSON 解析失败/超时的重试次数
 
@@ -61,6 +63,18 @@ DOUBAO_API_KEY: str = os.getenv("DOUBAO_API_KEY", "")
 DOUBAO_BASE_URL: str = os.getenv("DOUBAO_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
 DOUBAO_ENDPOINT_ID: str = os.getenv("DOUBAO_ENDPOINT_ID", "")
 
+# 本地 Ollama：走原生 /api/chat 接口，不需要 API Key。
+# 地址填服务根地址（不带 /v1）；模型名必须与 `ollama list` 中的名称一致。
+OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "qwen3.5:4b")
+OLLAMA_API_KEY: str = os.getenv("OLLAMA_API_KEY", "")  # 仅远程/带鉴权的 Ollama 需要
+OLLAMA_TIMEOUT: int = int(os.getenv("OLLAMA_TIMEOUT", "600"))  # 本地生成较慢，单独给足超时
+OLLAMA_MAX_TOKENS: int = int(os.getenv("OLLAMA_MAX_TOKENS", "8192"))
+OLLAMA_NUM_CTX: int = int(os.getenv("OLLAMA_NUM_CTX", "16384"))  # 上下文窗口
+# qwen3.5 默认会先输出思考过程，耗时长；默认关闭，需要推理时设为 1。
+OLLAMA_THINK: bool = os.getenv("OLLAMA_THINK", "0") == "1"
+OLLAMA_KEEP_ALIVE: str = os.getenv("OLLAMA_KEEP_ALIVE", "30m")  # 生成完继续驻留显存/内存
+
 # 全局开关：置 1 时强制离线，不访问任何外部大模型
 FORCE_MOCK: bool = os.getenv("FORCE_MOCK", "0") == "1"
 
@@ -68,8 +82,16 @@ FORCE_MOCK: bool = os.getenv("FORCE_MOCK", "0") == "1"
 def get_llm_endpoint() -> tuple[str, str, str]:
     """返回当前选用模型的 (api_key, base_url, model)。
 
-    选择了火山方舟且配置了 Key 时走方舟；否则默认走 DeepSeek。
+    - ``ollama``：本机原生接口，不需要 Key；
+    - ``doubao``：配置了方舟 Key 时走方舟；
+    - ``mock``：显式离线，返回空 Key，交给内置兜底逻辑；
+    - 其余情况默认走 DeepSeek。
     """
+    if LLM_PROVIDER == "ollama":
+        # Key 只用于可选鉴权；为空也保持“在线”，由本地服务提供模型。
+        return OLLAMA_API_KEY, OLLAMA_BASE_URL, OLLAMA_MODEL
+    if LLM_PROVIDER == "mock":
+        return "", "", LLM_MODEL
     if LLM_PROVIDER == "doubao" and DOUBAO_API_KEY:
         model = DOUBAO_ENDPOINT_ID or "deepseek-v4-pro-ga-260813"
         return DOUBAO_API_KEY, DOUBAO_BASE_URL, model
@@ -87,6 +109,10 @@ DB_PASSWORD: str = os.getenv("DB_PASSWORD", "")
 DB_NAME: str = os.getenv("DB_NAME", "graduation project")
 DB_CHARSET: str = "utf8mb4"
 
+# 测试模式：开启后，服务自动生成的会话编号带 test_ 前缀。
+# 测试结束时只清理这个前缀的会话，普通用户会话不受影响。
+TEST_MODE: bool = os.getenv("TEST_MODE", "0") == "1"
+
 
 # ---------------------------------------------------------------------------
 # 流程收敛配置
@@ -94,19 +120,32 @@ DB_CHARSET: str = "utf8mb4"
 MAX_ROUNDS: int = int(os.getenv("MAX_ROUNDS", "3"))  # 最大修复轮次
 PYTEST_TIMEOUT: int = int(os.getenv("PYTEST_TIMEOUT", "120"))  # pytest 子进程超时（秒）
 
+REVIEW_PARALLEL: bool = os.getenv("REVIEW_PARALLEL", "1") == "1"
+REVIEW_MAX_WORKERS: int = int(os.getenv("REVIEW_MAX_WORKERS", "4"))
+EXPORT_MAX_BYTES: int = int(os.getenv("EXPORT_MAX_BYTES", str(20 * 1024 * 1024)))
+
+
+# ---------------------------------------------------------------------------
+# 评测与消融实验配置
+# ---------------------------------------------------------------------------
+EVAL_DIR: Path = BASE_DIR / "evaluation"
+EVAL_DATASET_DIR: Path = EVAL_DIR / "datasets"
+EVAL_RESULT_DIR: Path = RESULTS_DIR
+EVAL_DEFAULT_LIMIT: int = int(os.getenv("EVAL_DEFAULT_LIMIT", "40"))
+EVAL_MAX_ROUNDS: int = int(os.getenv("EVAL_MAX_ROUNDS", str(MAX_ROUNDS)))
+EVAL_PYTEST_TIMEOUT: int = int(os.getenv("EVAL_PYTEST_TIMEOUT", str(PYTEST_TIMEOUT)))
+
 
 # ---------------------------------------------------------------------------
 # RAG 检索配置（Chroma 向量库）
 # ---------------------------------------------------------------------------
 RAG_COLLECTION: str = os.getenv("RAG_COLLECTION", "code_review_kb")
-RAG_EMBED_DIM: int = int(os.getenv("RAG_EMBED_DIM", "512"))  # 本地哈希向量维度
-RAG_TOP_K: int = int(os.getenv("RAG_TOP_K", "4"))  # 审核时最多注入的片段数
-RAG_GENERATE_TOP_K: int = int(os.getenv("RAG_GENERATE_TOP_K", "3"))  # 生成时最多注入的片段数
-RAG_MIN_SCORE: float = float(os.getenv("RAG_MIN_SCORE", "0.08"))  # 低于该相关度的片段丢弃
-RAG_MAX_CHUNK_CHARS: int = int(os.getenv("RAG_MAX_CHUNK_CHARS", "600"))  # 单片注入上限
-# 查询扩展：一次检索最多使用几个查询变体（原始查询 + 同义词扩展）
+RAG_EMBED_DIM: int = int(os.getenv("RAG_EMBED_DIM", "512"))
+RAG_TOP_K: int = int(os.getenv("RAG_TOP_K", "4"))
+RAG_GENERATE_TOP_K: int = int(os.getenv("RAG_GENERATE_TOP_K", "3"))
+RAG_MIN_SCORE: float = float(os.getenv("RAG_MIN_SCORE", "0.08"))
+RAG_MAX_CHUNK_CHARS: int = int(os.getenv("RAG_MAX_CHUNK_CHARS", "600"))
 RAG_QUERY_VARIANTS: int = int(os.getenv("RAG_QUERY_VARIANTS", "2"))
-# MMR 多样性重排：1.0 只看相关度，越小越强调片段之间的差异
 RAG_MMR_LAMBDA: float = float(os.getenv("RAG_MMR_LAMBDA", "0.85"))
 
 
@@ -124,7 +163,6 @@ UPLOAD_MAX_IMAGE_PIXELS: int = int(os.getenv("UPLOAD_MAX_IMAGE_PIXELS", "4000000
 UPLOAD_MAX_UNCOMPRESSED_BYTES: int = int(
     os.getenv("UPLOAD_MAX_UNCOMPRESSED_BYTES", str(100 * 1024 * 1024))
 )
-# 旧版 .doc 需要外部 Office/LibreOffice，不在跨平台链路中静默伪支持。
 UPLOAD_ALLOWED_EXTENSIONS: frozenset[str] = frozenset(
     {
         ".docx",
