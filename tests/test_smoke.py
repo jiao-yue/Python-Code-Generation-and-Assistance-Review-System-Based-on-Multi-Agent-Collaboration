@@ -248,3 +248,14 @@ def test_fix_prompt_formats_missing_line_number() -> None:
     assert "定位见代码" in text
     assert "行None" not in text
     assert "测试未通过" in text
+
+
+@pytest.mark.parametrize("raw", ["[]", "[1, 2]", '"not an object"'])
+def test_model_json_must_be_an_object(raw: str) -> None:
+    """合法但非对象的 JSON 也要明确拒绝，由模型重试机制处理。"""
+    import json
+
+    from services.chat_llm import ChatLLMService
+
+    with pytest.raises(json.JSONDecodeError, match="顶层必须是对象"):
+        ChatLLMService._parse_json(raw)

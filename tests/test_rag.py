@@ -89,6 +89,7 @@ def test_index_rebuilds_after_knowledge_changes(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(rag_module.settings, "KNOWLEDGE_DIR", knowledge)
     monkeypatch.setattr(rag_module.settings, "RAG_DIR", tmp_path / "rag")
     monkeypatch.setattr(rag_module.settings, "RAG_COLLECTION", "test_kb")
+    monkeypatch.setattr("services.upload_service.upload_service.knowledge_files", lambda: [])
 
     first = rag_module.RagRetriever()
     assert first.ensure_index() is True
@@ -98,6 +99,36 @@ def test_index_rebuilds_after_knowledge_changes(tmp_path, monkeypatch) -> None:
     second = rag_module.RagRetriever()
     assert second.ensure_index() is True
     assert second.chunk_count == 2
+
+
+def test_uploaded_markdown_is_loaded_after_refresh(tmp_path, monkeypatch) -> None:
+    """上传知识只有 refresh 后才进入现有实例，且片段数与检索内容同步更新。"""
+    import services.rag_retriever as rag_module
+
+    knowledge = tmp_path / "knowledge"
+    knowledge.mkdir()
+    (knowledge / "base.md").write_text("# 内置规范\n\n## 基础\n内置知识内容。\n", encoding="utf-8")
+    uploaded = tmp_path / "att_uploaded.md"
+    uploaded.write_text(
+        "# 上传规范\n\n## 专用条目\n上传知识库专用校验词：空输入先校验。\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(rag_module.settings, "KNOWLEDGE_DIR", knowledge)
+    monkeypatch.setattr(rag_module.settings, "RAG_DIR", tmp_path / "rag")
+    monkeypatch.setattr(rag_module.settings, "RAG_COLLECTION", "test_upload_refresh")
+    monkeypatch.setattr("services.upload_service.upload_service.knowledge_files", lambda: [])
+
+    retriever = rag_module.RagRetriever()
+    assert retriever.ensure_index() is True
+    assert retriever.chunk_count == 1
+
+    monkeypatch.setattr(
+        "services.upload_service.upload_service.knowledge_files", lambda: [uploaded]
+    )
+    assert retriever.refresh() is True
+    assert retriever.chunk_count == 2
+    hits = retriever.search("上传知识库专用校验词", top_k=2, min_score=0.0)
+    assert any(hit.doc == "att_uploaded" for hit in hits)
 
 
 def test_query_expansion_adds_english_synonyms() -> None:
