@@ -198,23 +198,34 @@ class ChatLLMService:
 
     @staticmethod
     def _parse_json(raw: str) -> dict[str, Any]:
-        """容错解析模型输出，返回第一个完整 JSON 对象。
+        """容错解析模型输出，并保证顶层一定是 JSON 对象。
 
         依次尝试：直接解析 → raw_decode 取首个 JSON → 截取最外层花括号。
+        ``[]``、``"text"`` 等虽然是合法 JSON，但调用方需要 ``.get()`` 字段，
+        因此必须在这里明确拒绝，再把错误交给上层重试，而不是晚点抛出属性错误。
         """
+
+        def require_object(value: Any, source: str) -> dict[str, Any]:
+            if not isinstance(value, dict):
+                raise json.JSONDecodeError("模型输出的 JSON 顶层必须是对象", source, 0)
+            return value
+
         text = raw.strip()
         try:
-            return json.loads(text)
+            value = json.loads(text)
         except json.JSONDecodeError:
             pass
+        else:
+            return require_object(value, text)
         try:
             value, _end = json.JSONDecoder().raw_decode(text)
-            return value
         except json.JSONDecodeError:
             pass
+        else:
+            return require_object(value, text)
         start, end = text.find("{"), text.rfind("}")
         if start != -1 and end > start:
-            return json.loads(text[start : end + 1])
+            return require_object(json.loads(text[start : end + 1]), text)
         raise json.JSONDecodeError("未找到可解析的 JSON 对象", text, 0)
 
     @staticmethod

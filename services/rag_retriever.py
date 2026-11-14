@@ -42,7 +42,7 @@ from config import settings
 from models.chat_schemas import RagHit
 
 # 索引版本：切分规则或向量算法变化时递增，触发全量重建
-_INDEX_VERSION = 2
+_INDEX_VERSION = 3  # v3：内置知识 + 上传知识，指纹包含标题与来源信息
 
 # 匹配 ASCII 标识符（含下划线）与中文字符
 _ASCII_TOKEN = re.compile(r"[a-z0-9_]{2,32}")
@@ -110,11 +110,16 @@ def _split_markdown(path: Path) -> list[_Chunk]:
 
 
 def _load_chunks() -> list[_Chunk]:
-    """读取 knowledge 目录下全部 markdown 文档并切分。"""
-    if not settings.KNOWLEDGE_DIR.exists():
-        return []
+    """读取内置知识和已导入的上传附件；仅聊天附件不会进入索引。"""
+    from services.upload_service import upload_service
+
+    paths: list[Path] = []
+    if settings.KNOWLEDGE_DIR.exists():
+        paths.extend(sorted(settings.KNOWLEDGE_DIR.glob("*.md")))
+    paths.extend(upload_service.knowledge_files())
+
     chunks: list[_Chunk] = []
-    for path in sorted(settings.KNOWLEDGE_DIR.glob("*.md")):
+    for path in paths:
         chunks.extend(_split_markdown(path))
     return chunks
 
@@ -125,6 +130,8 @@ def _fingerprint(chunks: list[_Chunk]) -> str:
     digest.update(f"v{_INDEX_VERSION}|dim{settings.RAG_EMBED_DIM}".encode())
     for chunk in sorted(chunks, key=lambda item: item.chunk_id):
         digest.update(chunk.chunk_id.encode("utf-8"))
+        digest.update(chunk.doc_title.encode("utf-8"))
+        digest.update(chunk.section.encode("utf-8"))
         digest.update(chunk.content.encode("utf-8"))
     return digest.hexdigest()
 
@@ -419,21 +426,36 @@ class RagRetriever:
     # 索引构建
     # ------------------------------------------------------------------
     def ensure_index(self) -> bool:
-        """确保索引可用；首次调用时建库，知识库变化时自动重建。"""
-        if self._initialized:
-            return self.available
+        """确保索引可用；首次调用建库，失败后的后续调用允许重试。"""
+        if self._initialized and self.available:
+            return True
         with self._lock:
-            if self._initialized:
-                return self.available
+            if self._initialized and self.available:
+                return True
             self._initialized = True
-            try:
-                self._build()
-                self.available = True
-            except Exception as exc:  # 检索失败不应影响主链路
-                self.error = f"{type(exc).__name__}: {exc}"
-                self.available = False
-                print(f"[RAG] 索引不可用，检索降级为空：{self.error}")
-            return self.available
+            return self._build_safely(action="索引初始化")
+
+    def refresh(self) -> bool:
+        """上传附件入库后强制比对内容指纹，必要时重建 Chroma 集合。"""
+        with self._lock:
+            self._initialized = True
+            return self._build_safely(action="索引刷新")
+
+    def _build_safely(self, action: str) -> bool:
+        """执行索引构建并统一维护可用状态。
+
+        调用方必须已经持有 ``self._lock``。RAG 是增强能力，构建失败时只降级
+        检索结果，不能让代码生成、审核或附件上传主链路一起失败。
+        """
+        try:
+            self._build()
+            self.available = True
+            self.error = ""
+        except Exception as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
+            self.available = False
+            print(f"[RAG] {action}失败，检索降级为空：{self.error}")
+        return self.available
 
     def _build(self) -> None:
         """读取知识库、比对指纹，必要时重建 Chroma 集合。"""
