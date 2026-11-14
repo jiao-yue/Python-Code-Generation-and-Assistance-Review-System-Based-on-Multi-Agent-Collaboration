@@ -72,7 +72,7 @@ class ChatReviewRequest(BaseModel):
     test_code: str = ""  # 可选：配套测试代码
     context: str = ""  # 可选：需求上下文
     conversation_id: str = ""  # 会话编号（为空则服务端生成）
-    title: str = ""  # 会话标题（前端自定义或后台默认“代码审核”）
+    title: str = ""  # 会话标题（为空则后端默认“代码审核”）
     attachment_ids: list[str] = Field(default_factory=list)  # 已上传的代码/文档附件 ID
 
 
@@ -464,6 +464,7 @@ def list_knowledge_documents() -> dict[str, Any]:
         documents = upload_service.list_records(knowledge_only=True)
     except UploadError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    documents = upload_service.list_records(knowledge_only=True)
     return {"documents": documents, "total": len(documents)}
 
 
