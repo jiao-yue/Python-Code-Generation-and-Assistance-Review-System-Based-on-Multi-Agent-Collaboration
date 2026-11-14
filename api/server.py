@@ -464,7 +464,6 @@ def list_knowledge_documents() -> dict[str, Any]:
         documents = upload_service.list_records(knowledge_only=True)
     except UploadError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    documents = upload_service.list_records(knowledge_only=True)
     return {"documents": documents, "total": len(documents)}
 
 
