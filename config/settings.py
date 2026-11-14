@@ -32,9 +32,12 @@ RESULTS_DIR: Path = STORAGE_DIR / "results"
 # 审核知识库（随代码提交）与向量索引（运行期产物，自动重建）
 KNOWLEDGE_DIR: Path = BASE_DIR / "knowledge"
 RAG_DIR: Path = STORAGE_DIR / "rag"
+# 用户上传的原件、提取文本和 MD5 清单（运行期数据，不提交到 Git）
+UPLOAD_DIR: Path = STORAGE_DIR / "uploads"
+UPLOAD_MANIFEST_PATH: Path = UPLOAD_DIR / "manifest.json"
 
 # 自动创建运行期目录，避免后续写文件时因目录不存在而报错
-for _directory in (STORAGE_DIR, GENERATED_DIR, LOGS_DIR, RESULTS_DIR, RAG_DIR):
+for _directory in (STORAGE_DIR, GENERATED_DIR, LOGS_DIR, RESULTS_DIR, RAG_DIR, UPLOAD_DIR):
     _directory.mkdir(parents=True, exist_ok=True)
 
 # 加载根目录 .env（包含 DeepSeek / 火山方舟的 API Key）
@@ -105,3 +108,41 @@ RAG_MAX_CHUNK_CHARS: int = int(os.getenv("RAG_MAX_CHUNK_CHARS", "600"))  # 单�
 RAG_QUERY_VARIANTS: int = int(os.getenv("RAG_QUERY_VARIANTS", "2"))
 # MMR 多样性重排：1.0 只看相关度，越小越强调片段之间的差异
 RAG_MMR_LAMBDA: float = float(os.getenv("RAG_MMR_LAMBDA", "0.85"))
+
+
+# ---------------------------------------------------------------------------
+# 附件上传与文档解析（Word / Excel / PDF / 图片 OCR）
+# ---------------------------------------------------------------------------
+UPLOAD_MAX_FILES: int = int(os.getenv("UPLOAD_MAX_FILES", "5"))
+UPLOAD_MAX_FILE_BYTES: int = int(os.getenv("UPLOAD_MAX_FILE_BYTES", str(20 * 1024 * 1024)))
+UPLOAD_MAX_TEXT_CHARS: int = int(os.getenv("UPLOAD_MAX_TEXT_CHARS", "200000"))
+UPLOAD_CHAT_FILE_CHARS: int = int(os.getenv("UPLOAD_CHAT_FILE_CHARS", "12000"))
+UPLOAD_CHAT_TOTAL_CHARS: int = int(os.getenv("UPLOAD_CHAT_TOTAL_CHARS", "30000"))
+UPLOAD_PDF_MAX_PAGES: int = int(os.getenv("UPLOAD_PDF_MAX_PAGES", "100"))
+UPLOAD_EXCEL_MAX_ROWS: int = int(os.getenv("UPLOAD_EXCEL_MAX_ROWS", "10000"))
+UPLOAD_MAX_IMAGE_PIXELS: int = int(os.getenv("UPLOAD_MAX_IMAGE_PIXELS", "40000000"))
+UPLOAD_MAX_UNCOMPRESSED_BYTES: int = int(
+    os.getenv("UPLOAD_MAX_UNCOMPRESSED_BYTES", str(100 * 1024 * 1024))
+)
+# 旧版 .doc 需要外部 Office/LibreOffice，不在跨平台链路中静默伪支持。
+UPLOAD_ALLOWED_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".docx",
+        ".xlsx",
+        ".xls",
+        ".pdf",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".bmp",
+        ".webp",
+        ".tif",
+        ".tiff",
+        ".txt",
+        ".py",
+        ".md",
+        ".csv",
+        ".json",
+        ".log",
+    }
+)
