@@ -8,8 +8,11 @@ FastAPI 后端：把“多智能体 Python 代码生成与审查系统”通过 
     GET    /api/conversations/{id}    读取单个会话的全部消息
     PATCH  /api/conversations/{id}    重命名会话（自定义标题）
     DELETE /api/conversations/{id}    删除会话及其全部消息（删除后重排消息编号）
+    POST   /api/uploads               上传附件、MD5 去重，可选导入 RAG
+    GET    /api/knowledge/documents   查看已入库的上传附件
     POST   /api/chat/generate         流式执行“需求确认→生成→审核→测试”（SSE）
     POST   /api/chat/review           流式执行“仅审核”（SSE）
+    POST   /api/chat/resume           回答澄清问题并恢复生成（SSE）
     GET    /                          打开前端网页（web/index.html）
 
 两个聊天接口都以 SSE（Server-Sent Events）逐段推送：
@@ -28,19 +31,22 @@ import json
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from config import settings
 from graph.chat_graph import has_pending_clarification, new_thread_id, stream_chat_pipeline
 from models.chat_schemas import ChatPipelineResult
 from services.chat_memory import chat_memory
+from services.document_parser import UploadError
 from services.rag_retriever import rag_retriever
+from services.upload_service import AttachmentText, upload_service
 
 # 项目根目录（本文件在 <root>/api/server.py，向上一级即根）
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -53,19 +59,21 @@ WEB_DIR = ROOT_DIR / "web"
 class ChatGenerateRequest(BaseModel):
     """POST /api/chat/generate 的请求体。"""
 
-    requirement: str  # 用户原始需求
+    requirement: str = ""  # 用户原始需求；有附件时可以为空
     conversation_id: str = ""  # 会话编号（为空则服务端生成）
     title: str = ""  # 会话标题（前端自定义或自动命名；为空则后端按需求截取）
+    attachment_ids: list[str] = Field(default_factory=list)  # 已上传附件 ID，正文由服务端读取
 
 
 class ChatReviewRequest(BaseModel):
     """POST /api/chat/review 的请求体。"""
 
-    code: str  # 待审核代码
+    code: str = ""  # 待审核代码；有代码附件时可以为空
     test_code: str = ""  # 可选：配套测试代码
     context: str = ""  # 可选：需求上下文
     conversation_id: str = ""  # 会话编号（为空则服务端生成）
-    title: str = ""  # 会话标题（为空则后端默认“代码审核”）
+    title: str = ""  # 会话标题（前端自定义或后台默认“代码审核”）
+    attachment_ids: list[str] = Field(default_factory=list)  # 已上传的代码/文档附件 ID
 
 
 class RenameRequest(BaseModel):
@@ -131,6 +139,33 @@ def _next_turn_no(conversation_id: str) -> int:
         return 1
     user_turns = sum(1 for m in existing["messages"] if m["role"] == "user")
     return user_turns + 1
+
+
+def _get_attachments(attachment_ids: list[str]) -> list[AttachmentText]:
+    """读取并校验附件；解析/清单错误统一转成 HTTP 400。"""
+    try:
+        return upload_service.attachments_for_chat(attachment_ids)
+    except (UploadError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _generation_input(requirement: str, attachments: list[AttachmentText]) -> str:
+    """把附件正文作为有明确来源的需求材料拼入生成链路。"""
+    parts = [requirement.strip()] if requirement.strip() else []
+    parts.extend(
+        f"【附件：{attachment.filename}】\n{attachment.text}" for attachment in attachments
+    )
+    return "\n\n".join(parts)
+
+
+def _review_input(code: str, attachments: list[AttachmentText]) -> str:
+    """把代码附件按文件边界拼接；注释分隔符不会破坏 Python 语法。"""
+    parts = [code.strip()] if code.strip() else []
+    parts.extend(
+        f"# ===== 附件：{attachment.filename} =====\n{attachment.text}"
+        for attachment in attachments
+    )
+    return "\n\n".join(parts)
 
 
 # ===========================================================================
@@ -250,6 +285,8 @@ def chat_event_stream(
 # 创建 FastAPI 应用
 # ===========================================================================
 app = FastAPI(title="多智能体 Python 代码生成与审查系统 API", version="2.0.0")
+# 索引刷新失败后，即使用户重传的是重复附件，也必须允许再次尝试刷新。
+_knowledge_refresh_pending = False
 
 app.add_middleware(
     CORSMiddleware,
@@ -338,19 +375,115 @@ def delete_conversation(conversation_id: str) -> dict[str, Any]:
     return {"status": "deleted", "id": conversation_id}
 
 
+@app.post("/api/uploads")
+async def upload_attachments(
+    files: Annotated[list[UploadFile], File()],
+    import_to_knowledge: Annotated[bool, Form()] = False,
+) -> dict[str, Any]:
+    """上传并解析附件；相同 MD5 复用记录，入库后统一刷新一次 RAG。
+
+    多文件上传采用逐文件结果：某一个文件格式错误不会撤销其他成功文件。
+    图片和扫描 PDF 的 OCR 在线程池中执行，避免阻塞 FastAPI 事件循环。
+    """
+    global _knowledge_refresh_pending
+    if len(files) > settings.UPLOAD_MAX_FILES:
+        raise HTTPException(
+            status_code=413, detail=f"一次最多上传 {settings.UPLOAD_MAX_FILES} 个文件"
+        )
+
+    results: list[dict[str, Any]] = []
+    refresh_needed = False
+    for upload in files:
+        filename = upload.filename or "未命名附件"
+        try:
+            data = await upload.read(settings.UPLOAD_MAX_FILE_BYTES + 1)
+            if len(data) > settings.UPLOAD_MAX_FILE_BYTES:
+                raise UploadError(
+                    f"单个文件不能超过 {settings.UPLOAD_MAX_FILE_BYTES // (1024 * 1024)} MB"
+                )
+            outcome = await run_in_threadpool(
+                upload_service.save_upload, filename, data, import_to_knowledge
+            )
+            if import_to_knowledge and outcome.record.get("in_knowledge"):
+                refresh_needed = (
+                    refresh_needed or outcome.knowledge_changed or _knowledge_refresh_pending
+                )
+            if import_to_knowledge and outcome.knowledge_changed:
+                message = (
+                    "MD5 重复，复用附件并已导入知识库"
+                    if outcome.duplicate
+                    else "已上传并导入知识库"
+                )
+            elif import_to_knowledge:
+                message = "MD5 重复，知识库中已存在，已跳过"
+            elif outcome.duplicate:
+                message = "MD5 重复，已复用原附件"
+            else:
+                message = "附件已上传"
+            results.append(
+                {
+                    "status": "duplicate" if outcome.duplicate else "uploaded",
+                    "message": message,
+                    "knowledge_changed": outcome.knowledge_changed,
+                    "attachment": outcome.record,
+                }
+            )
+        except UploadError as exc:
+            results.append({"status": "error", "filename": filename, "message": str(exc)})
+        except Exception as exc:
+            print(f"[Upload] {filename} 处理失败：{type(exc).__name__}: {exc}")
+            results.append(
+                {
+                    "status": "error",
+                    "filename": filename,
+                    "message": f"附件处理失败：{type(exc).__name__}",
+                }
+            )
+        finally:
+            await upload.close()
+
+    index_refreshed: bool | None = None
+    if refresh_needed:
+        index_refreshed = await run_in_threadpool(rag_retriever.refresh)
+        _knowledge_refresh_pending = not index_refreshed
+        if not index_refreshed:
+            for result in results:
+                if result.get("knowledge_changed"):
+                    result["message"] += "；资料已保存，但索引刷新失败，可稍后重试"
+    return {
+        "results": results,
+        "index_refreshed": index_refreshed,
+        "knowledge_chunks": rag_retriever.chunk_count if index_refreshed else None,
+    }
+
+
+@app.get("/api/knowledge/documents")
+def list_knowledge_documents() -> dict[str, Any]:
+    """列出已导入 RAG 的上传附件；内置 Markdown 不在此重复展示。"""
+    try:
+        documents = upload_service.list_records(knowledge_only=True)
+    except UploadError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {"documents": documents, "total": len(documents)}
+
+
 @app.post("/api/chat/generate")
 def chat_generate(req: ChatGenerateRequest) -> StreamingResponse:
-    """生成模式（SSE 流式）：需求确认→生成→审核→测试（含修复闭环）。"""
-    if not req.requirement.strip():
-        raise HTTPException(status_code=400, detail="需求不能为空")
+    """生成模式（SSE）：需求正文和附件材料一起进入确认、生成、审核与测试。"""
+    attachments = _get_attachments(req.attachment_ids)
+    requirement = _generation_input(req.requirement, attachments)
+    if not requirement.strip():
+        raise HTTPException(status_code=400, detail="需求或附件不能为空")
     conversation_id = req.conversation_id or f"c_{uuid.uuid4().hex[:12]}"
-    # 优先用前端传来的标题（用户自定义或前端自动命名），否则按需求前 18 字兜底
-    title = req.title.strip() or req.requirement.strip()[:18]
+    fallback_title = req.requirement.strip()[:18]
+    if not fallback_title and attachments:
+        fallback_title = attachments[0].filename[:18]
+    title = req.title.strip() or fallback_title or "附件代码生成"
     return StreamingResponse(
         chat_event_stream(
             mode="generate",
             conversation_id=conversation_id,
-            raw_requirement=req.requirement,
+            raw_requirement=requirement,
             pasted_code="",
             pasted_test="",
             persist_title=title,
@@ -362,9 +495,11 @@ def chat_generate(req: ChatGenerateRequest) -> StreamingResponse:
 
 @app.post("/api/chat/review")
 def chat_review(req: ChatReviewRequest) -> StreamingResponse:
-    """仅审核模式（SSE 流式）：静态工具 + LLM 审核，有测试则跑 pytest。"""
-    if not req.code.strip():
-        raise HTTPException(status_code=400, detail="待审核代码不能为空")
+    """仅审核模式（SSE）：粘贴代码与代码附件可单独或共同参与审核。"""
+    attachments = _get_attachments(req.attachment_ids)
+    code = _review_input(req.code, attachments)
+    if not code.strip():
+        raise HTTPException(status_code=400, detail="待审核代码或代码附件不能为空")
     conversation_id = req.conversation_id or f"c_{uuid.uuid4().hex[:12]}"
     requirement = req.context or "请审核以下代码的质量、安全与逻辑。"
     # 优先用前端标题，否则默认“代码审核”
@@ -374,7 +509,7 @@ def chat_review(req: ChatReviewRequest) -> StreamingResponse:
             mode="review",
             conversation_id=conversation_id,
             raw_requirement=requirement,
-            pasted_code=req.code,
+            pasted_code=code,
             pasted_test=req.test_code,
             persist_title=review_title,
             thread_id=new_thread_id(conversation_id),
@@ -393,15 +528,16 @@ def chat_resume(req: ChatResumeRequest) -> StreamingResponse:
     if conversation is None:
         raise HTTPException(status_code=404, detail="会话不存在或数据库不可用")
 
-    # 原始需求优先取请求体；否则回退到会话里的第一条用户消息
-    requirement = req.requirement.strip() or next(
+    # 优先使用持久化的原始需求：其中可能包含附件正文，服务重启后的恢复不能丢附件。
+    stored_requirement = next(
         (
             message.get("text", "")
             for message in conversation["messages"]
             if message.get("role") == "user" and message.get("kind") == "text"
         ),
-        "按已确认需求继续",
+        "",
     )
+    requirement = stored_requirement or req.requirement.strip() or "按已确认需求继续"
     title = req.title.strip() or conversation["title"]
     answer_text = "；".join(
         f"{item.question.strip()}：{item.answer.strip()}"
