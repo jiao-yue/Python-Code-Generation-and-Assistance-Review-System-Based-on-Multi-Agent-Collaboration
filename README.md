@@ -4,7 +4,9 @@
 
 - **代码生成**：需求确认 → 需求不明确时中断提问 → 按需求契约生成代码与测试 → 静态工具与 LLM 联合审核
   → pytest 测试 → 未通过时定向修复，形成闭环；
-- **只审核代码**：粘贴已有代码（可附测试），只做静态审核与测试，不生成、不改动用户代码。
+- **只审核代码**：粘贴已有代码（可附测试），只做静态审核与测试，不生成、不改动用户代码；
+- **附件材料**：上传 Word、Excel、PDF、图片或文本/代码附件，可用于当前对话，也可显式导入 RAG 知识库；
+  原始文件按完整字节 MD5 去重，图片与扫描 PDF 使用本地 OCR 提取文字。
 
 后端用 **FastAPI** 搭建，核心流程由 **LangGraph** 状态图编排，提示词采用 **few-shot 示例模式**，
 结果以 **SSE 阶段流式**返回；会话与每轮消息持久化到 **MySQL**（新建即落库、刷新不丢失、
@@ -29,6 +31,10 @@
 | 收敛判定 | 无阻断问题且 pytest 全绿即收敛，否则进入定向修复闭环（最多 `MAX_ROUNDS` 轮） |
 | 定向修复 | 按问题清单做最小化补丁，重出版本，保留可回退版本 |
 | RAG 规范检索 | Chroma 持久集合 + 本地哈希向量 + BM25 + 查询扩展 + MMR；生成与审核阶段注入规范条款 |
+| 附件上传 | 单次最多 5 个文件；支持 DOCX/XLSX/XLS/PDF/图片/文本与代码，可用于生成需求或只审核代码 |
+| 文档解析与 OCR | DOCX 正文/表格/页眉页脚、Excel 工作表/原始行号/公式、PDF 文本层与扫描页 OCR、图片本地 RapidOCR |
+| MD5 去重与隔离 | 按原始字节 MD5 复用附件；仅聊天与知识库用途隔离，重复文件不重复解析、不重复建立知识条目 |
+| 附件可靠性 | 原件/纯文本/RAG Markdown 分离持久化；原子写入、字符预算、异常页隔离、清单失败回滚与索引失败重试 |
 | 检索评估 | 20 条标注查询，对比纯向量/混合/混合+MMR 的 Recall、MRR、nDCG 与冗余度 |
 | 历史管理 | 历史对话支持自定义命名（行内重命名）与删除；自动命名不覆盖手动标题 |
 | 持久记忆 | 会话与消息持久化到 MySQL，新建即落库，刷新/重开浏览器不丢失 |
@@ -110,9 +116,9 @@ SSE 事件共四类：
 
 ## 三、RAG 检索与评估
 
-### 1. 知识库
+### 1. 内置知识库与上传资料
 
-`knowledge/` 下 7 篇 Markdown 规范，按二级标题切分为 **41 个片段**：
+`knowledge/` 下 7 篇内置 Markdown 规范，按二级标题切分为 **41 个基线片段**：
 
 | 文件 | 片段数 | 内容 |
 |---|---:|---|
@@ -124,13 +130,17 @@ SSE 事件共四类：
 | `code_review_cases.md` | 8 | Google 工程评审规范中文化改写：设计、功能、复杂度、测试、评论粒度 |
 | `security_review_cases.md` | 6 | OWASP 安全规范改写：输入校验、SQL 注入、命令/路径注入、日志与依赖 |
 
+用户显式选择“导入知识库”的上传附件，会从 `storage/uploads/knowledge/` 追加 Markdown 文档；
+仅用于当前对话的附件不会进入长期索引。因此，**41 个片段是内置知识库基线**，上传资料会额外增加片段，
+不会改写上述内置文档或离线标注集。
+
 ### 2. 检索链路
 
 ```
-knowledge/*.md
+knowledge/*.md + storage/uploads/knowledge/*.md（仅 in_knowledge=True）
   │ 按二级标题切分
   ▼
-41 个片段
+内置基线 41 个片段 + 已入库上传资料片段
   │ 本地哈希向量（512 维，中文 2/3-gram + 标识符词元）
   │ + 本地 BM25（k1=1.5, b=0.75）
   ▼
@@ -147,8 +157,9 @@ MMR 重排（λ=0.85）→ Top-K
 注入生成/审核提示词，并把命中来源返回前端
 ```
 
-检索层任何异常都会降级为空命中，不影响主链路继续执行；知识库内容指纹变化时
-`storage/rag` 自动重建，无需手动刷新。
+检索层任何异常都会降级为空命中，不影响主链路继续执行。索引版本为 3，指纹覆盖片段 ID、
+文档标题、小节和正文；内置或上传资料变化时自动重建 `storage/rag`。上传接口在一次批量操作后统一刷新，
+刷新失败会保留待重试状态，重传 MD5 重复文件也可以再次触发刷新，不会被“已入库”状态挡住。
 
 ### 3. 检索评估
 
@@ -174,16 +185,70 @@ python -m scripts.evaluate_rag
 
 ---
 
-## 四、目录结构
+## 四、附件上传、解析与去重
+
+### 1. 支持格式与解析边界
+
+| 类型 | 扩展名 | 当前实现 |
+| --- | --- | --- |
+| Word | `.docx` | 读取正文、表格、页眉页脚；旧版 `.doc` 返回明确的不支持提示 |
+| Excel | `.xlsx`、`.xls` | 保留工作表名和原始行号；XLSX 只读读取并保留公式文本，XLS 使用 xlrd |
+| PDF | `.pdf` | 优先提取文本层；有效文字过少的页面渲染后本地 OCR，单页异常不影响其他页面 |
+| 图片 | `.png`、`.jpg`、`.jpeg`、`.bmp`、`.webp`、`.tif`、`.tiff` | RapidOCR 本地文字识别；只承诺 OCR，不进行通用图像语义理解 |
+| 文本/代码 | `.txt`、`.py`、`.md`、`.csv`、`.json`、`.log` | UTF-8、带 BOM 的 UTF-8/UTF-16、GB18030 严格解码，保持原始代码内容 |
+
+附件既可用于“代码生成”的需求材料，也可用于“只审核代码”。审核链路使用**纯文本**而不是带标题、
+表格符号的 RAG Markdown，避免把文档标记误当成 Python 代码。OCR 引擎懒加载为单例，图片和扫描 PDF
+解析在线程池中执行，普通文本上传和服务启动不会初始化 OCR，也不会阻塞 FastAPI 事件循环。
+当前实现不依赖 Tesseract 或 LibreOffice。
+
+### 2. 三类数据分离与 MD5 去重
+
+所有附件数据都位于被 Git 忽略的运行期目录 `storage/uploads/`：
+
+```
+storage/uploads/
+├── files/          # 原始附件，以附件 ID 命名，不使用用户输入路径
+├── text/           # 当前对话使用的纯文本
+├── knowledge/      # RAG 使用的 Markdown
+└── manifest.json   # 元数据、原始文件 MD5、in_knowledge 与相对路径
+```
+
+- 附件 ID 为 `att_` 加原始文件完整字节的 32 位 MD5；MD5 只用于内容去重，并声明 `usedforsecurity=False`；
+- 相同内容即使改名也复用记录，同名但内容不同会得到不同 ID；复用前还会比较原始字节，防止极端哈希冲突覆盖文件；
+- 重复上传不会重复解析、OCR 或建立知识条目，无元数据变化时也不会重写 manifest；
+- 上传时可选择“导入知识库”。只有 `in_knowledge=True` 的附件进入长期索引，仅聊天附件与知识资料严格隔离；
+- 相同附件先用于聊天、后选择入库时，会补写 `in_knowledge` 并刷新索引；清单保存失败会回滚内存状态；
+- 提取文本丢失时给出明确错误，重传相同字节可恢复；中断恢复优先读取持久化的原始需求，避免附件正文丢失。
+
+### 3. 默认限制
+
+| 限制项 | 默认值 |
+| --- | ---: |
+| 单次文件数 | 5 |
+| 单文件大小 | 20 MB |
+| 单附件提取文本 | 200,000 字符 |
+| 对话附件 | 单文件 12,000 字符，总计 30,000 字符 |
+| PDF | 最多 100 页 |
+| Excel | 每个工作表最多 10,000 个非空数据行 |
+| 图片 | 最多 40,000,000 像素 |
+| Office 解压后总大小 | 最多 100 MB |
+
+对话截断标记本身也计入总字符预算，保证实际注入不会超过配置上限。对应配置集中在
+`config/settings.py`，可根据部署环境调整。
+
+---
+
+## 五、目录结构
 
 ```
 Graduation Project/
 ├── api/
-│   └── server.py              # FastAPI 后端：REST + SSE 接口，同时托管前端静态资源
+│   └── server.py              # FastAPI：REST + SSE + multipart 上传，同时托管前端静态资源
 ├── web/                       # 前端（HTML/CSS/JS，无需构建）
-│   ├── index.html             # 单页结构（纯文字，无图片/logo）
-│   ├── styles.css             # 豆包式简洁样式、历史项与重命名/删除按钮
-│   └── app.js                 # 会话管理、SSE 接收、结果/评分卡/问答卡渲染
+│   ├── index.html             # 单页结构（纯文字，无图片/logo）与附件上传控件
+│   ├── styles.css             # 豆包式简洁样式、历史项、附件列表与窄屏适配
+│   └── app.js                 # 会话管理、SSE、附件上传/移除/入库、结果/评分卡/问答卡渲染
 ├── graph/
 │   └── chat_graph.py          # LangGraph 状态图：节点、条件边、中断恢复、阶段流式
 ├── models/
@@ -203,7 +268,9 @@ Graduation Project/
 │   ├── chat_llm.py            # LLM 调用、JSON 解析、生成结果校验、重试
 │   ├── chat_memory.py         # MySQL 持久记忆：会话/消息、删除重命名、连续编号
 │   ├── chat_workspace.py      # 临时工程、静态工具调度、测试文件生命周期
-│   ├── rag_retriever.py       # Chroma + 哈希向量 + BM25 + 查询扩展 + MMR
+│   ├── document_parser.py     # DOCX/XLSX/XLS/PDF/图片/文本解析与本地 OCR
+│   ├── upload_service.py      # 附件 MD5 去重、原子写入、清单回滚、文本预算与知识隔离
+│   ├── rag_retriever.py       # 上传知识加载、Chroma + 混合检索 + MMR、失败重试
 │   ├── rag_eval.py            # Recall/MRR/nDCG/冗余度与三模式对比
 │   ├── review_scorecard.py    # 确定性评分卡与低置信度过滤
 │   ├── test_runner.py         # pytest 子进程执行与 JUnit 解析
@@ -216,10 +283,12 @@ Graduation Project/
 ├── tests/
 │   ├── test_smoke.py          # 主链路、修复闭环、生成校验、测试执行器
 │   ├── test_rag.py            # 检索、查询扩展、SQL 信号、评估指标
-│   ├── test_interrupt.py      # 中断与恢复
+│   ├── test_interrupt.py       # 中断与恢复
+│   ├── test_uploads.py        # 真实 Office/PDF、OCR 桩、MD5、清单回滚、multipart 与索引重试
 │   └── verify_chat_loop.py    # 确定性验证“审核→测试→修复”闭环
 ├── storage/                   # 运行期产物（自动重建，不入库）
 │   ├── generated/             # 每次运行的独立临时工程
+│   ├── uploads/               # 附件原件、纯文本、RAG Markdown 与 manifest
 │   └── rag/                   # Chroma 持久索引（自动重建）
 ├── requirements.txt
 ├── pyproject.toml
@@ -230,7 +299,7 @@ Graduation Project/
 
 ---
 
-## 五、持久化与连续编号机制
+## 六、持久化与连续编号机制
 
 ### 1. 新建即持久化
 
@@ -259,7 +328,7 @@ Graduation Project/
 
 ---
 
-## 六、环境与安装
+## 七、环境与安装
 
 - Python 3.13（`pyproject.toml` 要求 `>=3.13`）
 - MySQL 8.x（本机：localhost:3306，库名 `graduation project`，账号 root；库名含空格，SQL 中需反引号）
@@ -298,7 +367,7 @@ uv pip install -r requirements.txt
 
 ---
 
-## 七、运行方式
+## 八、运行方式
 
 ```powershell
 # 启动后端（同时托管前端页面）
@@ -310,7 +379,9 @@ python -m uvicorn api.server:app --host 127.0.0.1 --port 8000
 
 - **代码生成**：输入需求，依次展示需求确认、代码、审核问题、pytest 结果；需求不明确时先弹出问答卡，
   回答后继续生成；失败时自动修复并追加新版本；
-- **只审核代码**：粘贴代码（可附测试），只展示审核与测试结果，不生成代码。
+- **只审核代码**：粘贴代码（可附测试），只展示审核与测试结果，不生成代码；
+- **添加附件**：选择文件后可只用于当前对话，或勾选“导入知识库”；附件列表显示重复复用、解析警告和
+  索引进度，发送前可移除。图片与扫描 PDF 的识别文字会作为材料，不把图片当作通用视觉问答输入。
 
 ### 接口清单
 
@@ -322,36 +393,44 @@ python -m uvicorn api.server:app --host 127.0.0.1 --port 8000
 | GET | `/api/conversations/{id}` | 读取单个会话的全部消息 |
 | PATCH | `/api/conversations/{id}` | 重命名会话（自定义标题） |
 | DELETE | `/api/conversations/{id}` | 删除会话及其消息，删除后重排消息编号 |
-| POST | `/api/chat/generate` | 代码生成完整链路（SSE 流式） |
-| POST | `/api/chat/review` | 仅审核模式（SSE 流式） |
+| POST | `/api/uploads` | multipart 附件上传；`import_to_knowledge` 控制是否进入 RAG，逐文件返回结果 |
+| GET | `/api/knowledge/documents` | 列出已导入 RAG 的上传附件及元数据（不重复列出内置 Markdown） |
+| POST | `/api/chat/generate` | 代码生成完整链路（SSE 流式），`attachment_ids` 可引用已上传材料 |
+| POST | `/api/chat/review` | 仅审核模式（SSE 流式），支持粘贴代码与代码/文档附件 |
 | POST | `/api/chat/resume` | 提交澄清回答并恢复被中断的生成链路（SSE） |
 | GET | `/` | 前端首页 |
 
 ---
 
-## 八、测试与质量
+## 九、测试与质量
 
 ```powershell
-ruff check .                  # 代码规范检查
-ruff format --check .         # 格式检查
-pytest                        # 全量测试
+ruff check .                    # 代码规范检查
+ruff format --check .           # 格式检查
+pytest                          # 全量测试（当前 50 项）
+python -m compileall -q api config graph models prompts services scripts
+node --check web/app.js         # 前端 JavaScript 语法检查
 python -m scripts.evaluate_rag  # RAG 检索评估
 ```
 
-当前测试集共 **29 项**，覆盖：
+当前测试集共 **50 项**，覆盖：
 
-- 主链路生成、仅审核、离线兜底；
+- 主链路生成、仅审核、离线兜底、模型 JSON 对象校验与生成结果重试；
 - 需求中断与恢复（`tests/test_interrupt.py`）；
 - pytest 失败转阻断项、修复节点拿到失败原因；
 - 空测试文件清理、旧 JUnit 报告隔离；
-- 生成结果字段校验与重试；
-- RAG 查询扩展、SQL 信号命中、三模式评估指标。
+- RAG 查询扩展、SQL 信号命中、混合检索、MMR 与三模式评估指标；
+- 真实 DOCX/XLSX/XLS/PDF 解析、Excel 原始行号与公式保留、PDF 单页 OCR 异常隔离；
+- 图片/扫描 PDF OCR 桩、文本编码、图片 OCR 无文字提示；
+- 原始字节 MD5 去重、同名不同内容、重复上传不重写 manifest、清单失败回滚；
+- 仅聊天/知识库隔离、损坏清单保护、缺失文本恢复、对话字符预算、multipart 上传和索引失败重试。
 
 `tests/verify_chat_loop.py` 以确定性方式验证“审核 → 测试 → 修复”闭环，不依赖模型当次发挥。
+OCR 单元测试使用可重复桩，真实 RapidOCR 中英文识别另行做端到端验证，避免模型初始化拖慢回归套件。
 
 ---
 
-## 九、设计原则
+## 十、设计原则
 
 1. 核心流程由 LangGraph 编排，节点职责单一、可独立测试，跨节点数据通过共享状态传递；
 2. 静态工具负责确定性问题，LLM 负责逻辑/边界/异常的语义审核，pytest 负责最终可执行验证；
@@ -360,4 +439,5 @@ python -m scripts.evaluate_rag  # RAG 检索评估
 5. RAG 采用确定性混合检索与规则化查询扩展，不依赖在线 embedding 或 LLM 查询重写，结果可复现；
 6. 敏感信息（API Key、数据库口令）只从 `.env` 读取，不在代码中硬编码；
 7. 超轮次不收敛时 best-effort 输出当前最优代码与未解决清单，不挂起；
-8. 前端保持简洁、纯文字、无图片/logo，样式与交互统一维护在 `web/` 下。
+8. 附件原件、对话纯文本与 RAG Markdown 分离，MD5 仅用于内容去重，只有用户显式入库的资料才进入长期索引；
+9. 前端保持简洁、纯文字、无图片/logo，样式与交互统一维护在 `web/` 下。
