@@ -39,6 +39,7 @@
 | 历史管理 | 历史对话支持自定义命名（行内重命名）与删除；自动命名不覆盖手动标题 |
 | 持久记忆 | 会话与消息持久化到 MySQL，新建即落库，刷新/重开浏览器不丢失 |
 | 连续编号 | 消息主键按“会话→轮次→原序”重排为连续整数，删除后自动重排、无空洞 |
+| 本地 Ollama | `LLM_PROVIDER=ollama` 时走原生 `/api/chat`，无 Key 仍在线；DeepSeek、火山方舟与离线 Mock 行为不变 |
 | 离线兜底 | 未配置 API Key 或 `FORCE_MOCK=1` 时使用内置 Mock，整条链路仍可完整运行 |
 
 ### 代码审核如何参考 EEC
@@ -121,7 +122,7 @@ SSE 事件共四类：
 `knowledge/` 下 7 篇内置 Markdown 规范，按二级标题切分为 **41 个基线片段**：
 
 | 文件 | 片段数 | 内容 |
-|---|---:|---|
+| --- | ---:| --- |
 | `python_style.md` | 5 | 命名、注释、类型注解、代码风格 |
 | `security.md` | 6 | eval/exec、反序列化、密钥、网络与异常泄露 |
 | `logic_boundary.md` | 6 | 空值、越界、异常、并发、可变默认参数 |
@@ -166,7 +167,7 @@ MMR 重排（λ=0.85）→ Top-K
 标注集在 `scripts/rag_eval_cases.json`（20 条查询，知识库 41 个片段，K=4）：
 
 | 模式 | Recall@4 | MRR | nDCG@4 | 冗余度 |
-|---|---:|---:|---:|---:|
+| --- | ---:| ---:| ---:| ---:|
 | 纯向量 | 0.750 | 0.725 | 0.732 | 0.0215 |
 | 混合检索 | 1.000 | 0.942 | 0.957 | 0.0284 |
 | 混合 + MMR | 1.000 | 0.942 | 0.957 | 0.0242 |
@@ -265,7 +266,7 @@ Graduation Project/
 │   ├── code_review_cases.md
 │   └── security_review_cases.md
 ├── services/
-│   ├── chat_llm.py            # LLM 调用、JSON 解析、生成结果校验、重试
+│   ├── chat_llm.py            # LLM 调用、Ollama 原生分流、JSON 解析、生成结果校验、重试
 │   ├── chat_memory.py         # MySQL 持久记忆：会话/消息、删除重命名、连续编号
 │   ├── chat_workspace.py      # 临时工程、静态工具调度、测试文件生命周期
 │   ├── document_parser.py     # DOCX/XLSX/XLS/PDF/图片/文本解析与本地 OCR
@@ -279,12 +280,14 @@ Graduation Project/
 │   ├── evaluate_rag.py        # RAG 评估 CLI
 │   └── rag_eval_cases.json    # 20 条标注查询
 ├── docs/
+│   ├── local-ollama.md        # 本地 Ollama 配置、实测与排错
 │   └── rag-cases.md           # GitHub RAG 案例调研与落地记录
 ├── tests/
 │   ├── test_smoke.py          # 主链路、修复闭环、生成校验、测试执行器
 │   ├── test_rag.py            # 检索、查询扩展、SQL 信号、评估指标
-│   ├── test_interrupt.py       # 中断与恢复
+│   ├── test_interrupt.py      # 中断与恢复
 │   ├── test_uploads.py        # 真实 Office/PDF、OCR 桩、MD5、清单回滚、multipart 与索引重试
+│   ├── test_local_provider.py # 本地 Ollama 无 Key 在线判定与 JSON/纯文本分流
 │   └── verify_chat_loop.py    # 确定性验证“审核→测试→修复”闭环
 ├── storage/                   # 运行期产物（自动重建，不入库）
 │   ├── generated/             # 每次运行的独立临时工程
@@ -351,6 +354,8 @@ uv pip install -r requirements.txt
 - 默认使用 **DeepSeek**（`.env` 中配置 `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL=https://api.deepseek.com`，
   模型 `deepseek-chat`）；
 - 也可把 `LLM_PROVIDER` 设为 `doubao` 切换到火山方舟（OpenAI 兼容接口）；
+- 设为 `ollama` 可调用本机 Ollama，默认地址 `http://127.0.0.1:11434`，模型可用 `OLLAMA_MODEL` 指定；
+  本地不需要 API Key，详细配置见 [`docs/local-ollama.md`](docs/local-ollama.md)；
 - 设置 `FORCE_MOCK=1` 可强制离线运行，Mock 使用确定性兜底代码，保证无网络也能演示完整链路。
 
 ### RAG 相关配置
@@ -407,13 +412,13 @@ python -m uvicorn api.server:app --host 127.0.0.1 --port 8000
 ```powershell
 ruff check .                    # 代码规范检查
 ruff format --check .           # 格式检查
-pytest                          # 全量测试（当前 50 项）
+pytest                          # 全量测试（当前 52 项）
 python -m compileall -q api config graph models prompts services scripts
 node --check web/app.js         # 前端 JavaScript 语法检查
 python -m scripts.evaluate_rag  # RAG 检索评估
 ```
 
-当前测试集共 **50 项**，覆盖：
+当前测试集共 **52 项**，覆盖：
 
 - 主链路生成、仅审核、离线兜底、模型 JSON 对象校验与生成结果重试；
 - 需求中断与恢复（`tests/test_interrupt.py`）；
@@ -423,7 +428,8 @@ python -m scripts.evaluate_rag  # RAG 检索评估
 - 真实 DOCX/XLSX/XLS/PDF 解析、Excel 原始行号与公式保留、PDF 单页 OCR 异常隔离；
 - 图片/扫描 PDF OCR 桩、文本编码、图片 OCR 无文字提示；
 - 原始字节 MD5 去重、同名不同内容、重复上传不重写 manifest、清单失败回滚；
-- 仅聊天/知识库隔离、损坏清单保护、缺失文本恢复、对话字符预算、multipart 上传和索引失败重试。
+- 仅聊天/知识库隔离、损坏清单保护、缺失文本恢复、对话字符预算、multipart 上传和索引失败重试；
+- 本地 Ollama 无 Key 在线判定与 JSON/纯文本分流（`tests/test_local_provider.py`）。
 
 `tests/verify_chat_loop.py` 以确定性方式验证“审核 → 测试 → 修复”闭环，不依赖模型当次发挥。
 OCR 单元测试使用可重复桩，真实 RapidOCR 中英文识别另行做端到端验证，避免模型初始化拖慢回归套件。
