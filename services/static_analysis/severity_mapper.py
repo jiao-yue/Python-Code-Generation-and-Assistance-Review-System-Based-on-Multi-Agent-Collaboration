@@ -1,8 +1,10 @@
 """
 严重度映射（对应“工具规则码映射为统一 severity 后与 LLM 发现合并去重”）。
 
-把 Ruff / Bandit / ast / MyPy 各自的规则码与严重度，统一映射为三级：
+把 Ruff / Bandit 各自的规则码与严重度，统一映射为三级：
     阻断（不可运行/安全隐患）、主要（逻辑/边界/异常）、次要（规范/命名）。
+ast 检查的严重度由 ast_runner 按规则直接判定（语法/危险调用=阻断，缺守卫=主要），
+不在本模块映射。
 """
 
 from __future__ import annotations
@@ -98,11 +100,4 @@ def map_bandit(test_id: str, bandit_severity: str = "") -> Severity:
             return Severity.BLOCKER
         if sev == "MEDIUM":
             return Severity.MAJOR
-    return Severity.MINOR
-
-
-def map_ast(message: str) -> Severity:
-    """ast 检查问题 → severity（语法不可运行属阻断，其余结构提示属次要）。"""
-    if "语法" in message or "Syntax" in message or "无法" in message:
-        return Severity.BLOCKER
     return Severity.MINOR

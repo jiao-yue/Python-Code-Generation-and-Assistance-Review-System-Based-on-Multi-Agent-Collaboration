@@ -34,9 +34,16 @@ def run_module(args: list[str], timeout: int = 60, cwd: str | None = None) -> tu
         return -2, "", f"工具不存在：{e}"
 
 
-def relativize(path: str, root: str | Path) -> str:
-    """把绝对路径转成相对路径（失败则原样返回文件名）。"""
+def relativize(path: str | Path, root: str | Path) -> str:
+    """把工具输出的路径转成相对 root 的 posix 路径，供 Ruff/Bandit 展示统一口径。
+
+    root 是文件（单文件检查）或路径不在 root 下时，回退为文件名。
+    """
+    file_path = Path(path)
+    root_path = Path(root)
+    if not root_path.is_dir():
+        return file_path.name
     try:
-        return str(Path(path).relative_to(root)).replace("\\", "/")
-    except Exception:
-        return Path(path).name
+        return file_path.resolve().relative_to(root_path.resolve()).as_posix()
+    except ValueError:
+        return file_path.name

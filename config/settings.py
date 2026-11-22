@@ -120,8 +120,11 @@ TEST_MODE: bool = os.getenv("TEST_MODE", "0") == "1"
 MAX_ROUNDS: int = int(os.getenv("MAX_ROUNDS", "3"))  # 最大修复轮次
 PYTEST_TIMEOUT: int = int(os.getenv("PYTEST_TIMEOUT", "120"))  # pytest 子进程超时（秒）
 
+# 三视角审查：spec / security / logic 各自独立调用大模型，再合并问题。
+# 关闭后回退到单次 review_code 调用，便于对比与排查限流问题。
 REVIEW_PARALLEL: bool = os.getenv("REVIEW_PARALLEL", "1") == "1"
 REVIEW_MAX_WORKERS: int = int(os.getenv("REVIEW_MAX_WORKERS", "4"))
+# 评测结果导出上限；防止异常大的会话把内存打满。
 EXPORT_MAX_BYTES: int = int(os.getenv("EXPORT_MAX_BYTES", str(20 * 1024 * 1024)))
 
 
@@ -129,8 +132,6 @@ EXPORT_MAX_BYTES: int = int(os.getenv("EXPORT_MAX_BYTES", str(20 * 1024 * 1024))
 # 评测与消融实验配置
 # ---------------------------------------------------------------------------
 EVAL_DIR: Path = BASE_DIR / "evaluation"
-EVAL_DATASET_DIR: Path = EVAL_DIR / "datasets"
-EVAL_RESULT_DIR: Path = RESULTS_DIR
 EVAL_DEFAULT_LIMIT: int = int(os.getenv("EVAL_DEFAULT_LIMIT", "40"))
 EVAL_MAX_ROUNDS: int = int(os.getenv("EVAL_MAX_ROUNDS", str(MAX_ROUNDS)))
 EVAL_PYTEST_TIMEOUT: int = int(os.getenv("EVAL_PYTEST_TIMEOUT", str(PYTEST_TIMEOUT)))
@@ -140,12 +141,13 @@ EVAL_PYTEST_TIMEOUT: int = int(os.getenv("EVAL_PYTEST_TIMEOUT", str(PYTEST_TIMEO
 # RAG 检索配置（Chroma 向量库）
 # ---------------------------------------------------------------------------
 RAG_COLLECTION: str = os.getenv("RAG_COLLECTION", "code_review_kb")
-RAG_EMBED_DIM: int = int(os.getenv("RAG_EMBED_DIM", "512"))
-RAG_TOP_K: int = int(os.getenv("RAG_TOP_K", "4"))
-RAG_GENERATE_TOP_K: int = int(os.getenv("RAG_GENERATE_TOP_K", "3"))
-RAG_MIN_SCORE: float = float(os.getenv("RAG_MIN_SCORE", "0.08"))
-RAG_MAX_CHUNK_CHARS: int = int(os.getenv("RAG_MAX_CHUNK_CHARS", "600"))
+RAG_EMBED_DIM: int = int(os.getenv("RAG_EMBED_DIM", "512"))  # 本地哈希向量维度
+RAG_TOP_K: int = int(os.getenv("RAG_TOP_K", "4"))  # 审核时最多注入的片段数
+RAG_GENERATE_TOP_K: int = int(os.getenv("RAG_GENERATE_TOP_K", "3"))  # 生成时最多注入的片段数
+RAG_MIN_SCORE: float = float(os.getenv("RAG_MIN_SCORE", "0.08"))  # 低于该相关度的片段丢弃
+# 查询扩展：一次检索最多使用几个查询变体（原始查询 + 同义词扩展）
 RAG_QUERY_VARIANTS: int = int(os.getenv("RAG_QUERY_VARIANTS", "2"))
+# MMR 多样性重排：1.0 只看相关度，越小越强调片段之间的差异
 RAG_MMR_LAMBDA: float = float(os.getenv("RAG_MMR_LAMBDA", "0.85"))
 
 
@@ -163,6 +165,7 @@ UPLOAD_MAX_IMAGE_PIXELS: int = int(os.getenv("UPLOAD_MAX_IMAGE_PIXELS", "4000000
 UPLOAD_MAX_UNCOMPRESSED_BYTES: int = int(
     os.getenv("UPLOAD_MAX_UNCOMPRESSED_BYTES", str(100 * 1024 * 1024))
 )
+# 旧版 .doc 需要外部 Office/LibreOffice，不在跨平台链路中静默伪支持。
 UPLOAD_ALLOWED_EXTENSIONS: frozenset[str] = frozenset(
     {
         ".docx",

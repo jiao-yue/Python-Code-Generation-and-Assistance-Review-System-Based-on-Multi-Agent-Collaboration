@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 
 from models.common import ToolFinding
-from services.static_analysis.base_runner import run_module
+from services.static_analysis.base_runner import relativize, run_module
 from services.static_analysis.severity_mapper import map_ruff
 
 
@@ -37,16 +37,18 @@ def run_ruff(target: str | Path, timeout: int = 60) -> list[ToolFinding]:
         return []
 
     findings: list[ToolFinding] = []
+    base = Path(target)
     for rec in records:
         code = rec.get("code") or ""
         loc = rec.get("location", {})
+        display_path = relativize(rec.get("filename", "solution.py"), base)
         findings.append(
             ToolFinding(
                 source="tool",
                 tool="Ruff",
                 rule_code=code,
                 severity=map_ruff(code),
-                file_path=Path(rec.get("filename", "solution.py")).name,
+                file_path=display_path,
                 line_no=loc.get("row"),
                 message=rec.get("message", ""),
             )

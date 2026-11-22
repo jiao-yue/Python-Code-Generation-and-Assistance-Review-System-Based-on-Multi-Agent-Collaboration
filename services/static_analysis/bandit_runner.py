@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 
 from models.common import ToolFinding
-from services.static_analysis.base_runner import run_module
+from services.static_analysis.base_runner import relativize, run_module
 from services.static_analysis.severity_mapper import map_bandit
 
 
@@ -47,13 +47,14 @@ def run_bandit(target: str | Path, timeout: int = 60) -> list[ToolFinding]:
     for rec in data.get("results", []):
         test_id = rec.get("test_id", "")
         bandit_sev = rec.get("issue_severity", "")
+        display_path = relativize(rec.get("filename", "solution.py"), target_path)
         findings.append(
             ToolFinding(
                 source="tool",
                 tool="Bandit",
                 rule_code=test_id,
                 severity=map_bandit(test_id, bandit_sev),
-                file_path=Path(rec.get("filename", "solution.py")).name,
+                file_path=display_path,
                 line_no=rec.get("line_number"),
                 message=f"{rec.get('test_name', '')}: {rec.get('issue_text', '')}",
             )
