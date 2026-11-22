@@ -6,6 +6,8 @@
          POST /api/uploads 上传附件并按 MD5 去重，可仅用于对话或导入 RAG；
          POST /api/chat/generate（代码生成）/ POST /api/chat/review（仅审核），均为 SSE 流式
    说明：历史项支持悬停重命名与删除，消息编号在删除后重排为连续序号，不引入图片/logo
+   展示：对话采用左右布局（用户消息在右、助手输出在左），助手输出仿豆包富文本风格
+        （标题、要点列表、代码块、表格、引用），由内置 Markdown 渲染器安全渲染
    ========================================================================== */
 "use strict";
 
@@ -17,6 +19,7 @@ let editingId = null;                   // 正在重命名的会话 ID（同时�
 let uploading = false;                  // 是否正在上传/解析附件
 let pendingAttachments = [];            // 待发送消息携带的附件（知识库上传不加入）
 let uploadPurpose = "chat";             // chat：当前对话；knowledge：导入 RAG
+let testMode = false;                   // 后端是否处于测试模式（会话编号加 test_ 前缀）
 
 /* ---------------- DOM 引用 ---------------- */
 const messagesEl = document.getElementById("messages");
@@ -140,7 +143,7 @@ function current() {
 }
 
 function newId() {
-  return "c_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6);
+  return (testMode ? "test_" : "c_") + Date.now() + "_" + Math.random().toString(36).slice(2, 6);
 }
 
 /* ============================== 会话管理 ============================== */
@@ -323,6 +326,13 @@ function applyStreamEvent(event, conv, loadingMsg) {
   const idx = conv.messages.indexOf(loadingMsg);
   if (event.type === "stage") {
     loadingMsg.label = event.label;
+    if (event.partial) {
+      // 增量结果到达：转为流式消息，内容边增长边逐行揭示
+      loadingMsg.kind = "streaming";
+      loadingMsg.data = event.partial;
+      if (typeof loadingMsg.revealed !== "number") loadingMsg.revealed = 0;
+      startReveal();
+    }
     render();
   } else if (event.type === "interrupt") {
     // 需求存在必须澄清的歧义：把加载占位替换成问题卡，等待用户回答
@@ -340,8 +350,17 @@ function applyStreamEvent(event, conv, loadingMsg) {
     conv.persisted = true;
     render();
   } else if (event.type === "result") {
-    // 只有在审核与测试全部跑完后，后端才会推送 result，前端此时才渲染码与报告
-    if (idx !== -1) conv.messages[idx] = { role: "assistant", kind: "result", data: event.data };
+    // 最终结果到达：流式揭示未收尾时先补完剩余内容，再切换为完整答案
+    if (idx !== -1) {
+      const msg = conv.messages[idx];
+      if (msg.kind === "streaming") {
+        msg.finalData = event.data;
+        msg.label = "";
+        startReveal();
+      } else {
+        conv.messages[idx] = { role: "assistant", kind: "result", data: event.data };
+      }
+    }
     conv.persisted = true;
     if (!conv.messages.some((m) => m.kind === "loading")) render();
   } else if (event.type === "error") {
@@ -596,28 +615,86 @@ function renderMessages() {
   messagesEl.innerHTML = "";
   conv.messages.forEach((m, index) => {
     if (m.role === "user") {
-      messagesEl.appendChild(row(`<div class="user-bubble">${esc(m.text)}</div>`));
+      // 用户消息：右侧蓝色气泡
+      messagesEl.appendChild(row(`<div class="user-bubble">${esc(m.text)}</div>`, "user"));
     } else if (m.kind === "loading") {
+      // 阶段进度：仿豆包的“正在思考/处理”文案，label 随 SSE 阶段事件实时更新
       messagesEl.appendChild(row(
-        `<div class="a-card"><div class="loading-card"><span class="spinner"></span>${esc(m.label)}</div></div>`
+        `<div class="md-bubble"><div class="loading-card"><span class="spinner"></span>${esc(m.label)}</div></div>`,
+        "assistant"
       ));
     } else if (m.kind === "error") {
+      // 运行错误：仿豆包的提示文案，直接说明原因
       messagesEl.appendChild(row(
-        `<div class="a-card" style="color:var(--blocker)">运行出错：${esc(m.text)}</div>`
+        `<div class="md-bubble"><div class="md md-error"><p>⚠️ <strong>运行出错</strong>：${esc(m.text)}</p></div></div>`,
+        "assistant"
       ));
     } else if (m.kind === "question") {
-      messagesEl.appendChild(row(questionCard(m, index, conv.messages.length)));
+      messagesEl.appendChild(row(questionCard(m, index, conv.messages.length), "assistant"));
+    } else if (m.kind === "streaming") {
+      // 流式输出：已接收内容逐行揭示，末尾光标 + 当前阶段文案
+      const shown = streamMarkdown(m).split("\n").slice(0, m.revealed || 0).join("\n");
+      messagesEl.appendChild(row(
+        `<div class="md-bubble"><div class="md md-stream">${mdToHtml(shown)}</div>` +
+        (m.label ? `<div class="loading-card"><span class="spinner"></span>${esc(m.label)}</div>` : "") +
+        `</div>`,
+        "assistant"
+      ));
     } else {
-      messagesEl.appendChild(row(renderResult(m.data)));
+      // 最终结果：仿豆包富文本答案（需求/代码/审核/测试分节展示）
+      messagesEl.appendChild(row(renderResult(m.data), "assistant"));
     }
   });
   bindQuestionCards();
+  bindExportButtons();
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
-function row(inner) {
+/* ============================== 流式揭示（仿豆包打字机） ============================== */
+let revealTimer = null;
+
+/* 流式消息的目标文档：收尾前用增量 payload，收尾后用最终结果 */
+function streamMarkdown(m) {
+  return resultToMarkdown(m.finalData || m.data);
+}
+
+function startReveal() {
+  if (revealTimer === null) revealTimer = setInterval(tickReveal, 24);
+}
+
+function tickReveal() {
+  let changed = false;
+  let active = false;
+  conversations.forEach((conv) => {
+    conv.messages.forEach((m) => {
+      if (m.kind !== "streaming") return;
+      const lines = streamMarkdown(m).split("\n");
+      if (m.revealed < lines.length) {
+        // 每 tick 揭示 2 行：代码块逐行生长，与豆包流式输出观感一致
+        m.revealed = Math.min(lines.length, m.revealed + 2);
+        changed = true;
+        active = true;
+      } else if (m.finalData) {
+        // 揭示追平且最终结果已到：切换为完整答案（含导出按钮）
+        m.kind = "result";
+        m.data = m.finalData;
+        delete m.finalData;
+        delete m.revealed;
+        changed = true;
+      }
+    });
+  });
+  if (changed) render();
+  if (!active) {
+    clearInterval(revealTimer);
+    revealTimer = null;
+  }
+}
+
+function row(inner, role) {
   const wrap = document.createElement("div");
-  wrap.className = "msg-row";
+  // user 靠右、assistant 靠左，由 CSS 的 .msg-row.user / .msg-row.assistant 控制
+  wrap.className = "msg-row " + (role === "user" ? "user" : "assistant");
   const body = document.createElement("div");
   body.className = "msg-body";
   // 不使用任何头像/logo，直接渲染消息内容
@@ -626,14 +703,130 @@ function row(inner) {
   return wrap;
 }
 
+/* ============================== Markdown 渲染（仿豆包输出） ==============================
+   轻量 Markdown → HTML：先整体转义再解析，模型/用户内容无法注入 HTML。
+   支持：标题、段落、粗体、行内代码、围栏代码块（带复制）、列表、表格、引用、分隔线 */
+
+/* 生成围栏代码块；代码本身含 ``` 时自动加长围栏，保证内容完整 */
+function fence(code, lang) {
+  const text = String(code ?? "");
+  let ticks = "```";
+  while (text.includes(ticks)) ticks += "`";
+  return ticks + (lang || "") + "\n" + text + "\n" + ticks;
+}
+
+/* 深色代码块：语言标签 + 复制按钮，沿用现有复制事件委托 */
+function codeBlockHtml(lang, code) {
+  const id = "co_" + Math.random().toString(36).slice(2, 9);
+  return `
+  <div class="code-wrap">
+    <div class="code-head"><span>${esc(lang || "text")}</span><button class="copy-btn" data-target="${id}">复制</button></div>
+    <pre class="code" id="${id}">${esc(code)}</pre>
+  </div>`;
+}
+
+/* 行内格式：先保护行内代码，再处理粗体，最后还原代码 */
+function inlineMd(s) {
+  const codes = [];
+  let text = s.replace(/`([^`]+)`/g, (_, c) => {
+    codes.push(c);
+    return "\u0000C" + (codes.length - 1) + "\u0000";
+  });
+  text = text.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  return text.replace(/\u0000C(\d+)\u0000/g, (_, n) => `<code class="inline">${codes[Number(n)]}</code>`);
+}
+
+function mdToHtml(md) {
+  // 1) 按行抽出围栏代码块，避免代码内容被误当作 Markdown 解析
+  const blocks = [];
+  const kept = [];
+  const rawLines = String(md ?? "").split("\n");
+  for (let i = 0; i < rawLines.length; i++) {
+    const open = rawLines[i].match(/^(`{3,})(.*)$/);
+    if (open) {
+      const ticks = open[1];
+      const lang = open[2].trim();
+      const body = [];
+      i++;
+      while (i < rawLines.length && rawLines[i].trim() !== ticks) { body.push(rawLines[i]); i++; }
+      blocks.push({ lang, code: body.join("\n") });
+      kept.push("\u0000B" + (blocks.length - 1) + "\u0000");
+    } else {
+      kept.push(rawLines[i]);
+    }
+  }
+  // 2) 整体转义后再做块级解析，保证输出安全
+  const lines = esc(kept.join("\n")).split("\n");
+  const out = [];
+  let para = [];
+  const flush = () => {
+    if (para.length) { out.push("<p>" + inlineMd(para.join("<br>")) + "</p>"); para = []; }
+  };
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i].trim();
+    const bm = line.match(/^\u0000B(\d+)\u0000$/);
+    if (bm) { flush(); const b = blocks[Number(bm[1])]; out.push(codeBlockHtml(b.lang, b.code)); i++; continue; }
+    if (!line) { flush(); i++; continue; }
+    const h = line.match(/^(#{1,4})\s+(.*)$/);
+    if (h) { flush(); const lvl = Math.min(h[1].length + 1, 5); out.push(`<h${lvl}>${inlineMd(h[2])}</h${lvl}>`); i++; continue; }
+    if (/^-{3,}$/.test(line)) { flush(); out.push("<hr>"); i++; continue; }
+    if (line.startsWith("&gt;")) {
+      flush();
+      const q = [];
+      while (i < lines.length && lines[i].trim().startsWith("&gt;")) {
+        q.push(lines[i].trim().replace(/^&gt;\s?/, "")); i++;
+      }
+      out.push("<blockquote>" + inlineMd(q.join("<br>")) + "</blockquote>");
+      continue;
+    }
+    if (/^[-*]\s+/.test(line)) {
+      flush();
+      const items = [];
+      while (i < lines.length && /^[-*]\s+/.test(lines[i].trim())) {
+        items.push(lines[i].trim().replace(/^[-*]\s+/, "")); i++;
+      }
+      out.push("<ul>" + items.map((x) => `<li>${inlineMd(x)}</li>`).join("") + "</ul>");
+      continue;
+    }
+    if (/^\d+\.\s+/.test(line)) {
+      flush();
+      const items = [];
+      while (i < lines.length && /^\d+\.\s+/.test(lines[i].trim())) {
+        items.push(lines[i].trim().replace(/^\d+\.\s+/, "")); i++;
+      }
+      out.push("<ol>" + items.map((x) => `<li>${inlineMd(x)}</li>`).join("") + "</ol>");
+      continue;
+    }
+    if (line.startsWith("|") && i + 1 < lines.length && /^\|[\s:|-]+\|$/.test(lines[i + 1].trim())) {
+      flush();
+      const cells = (l) => l.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+      const head = cells(lines[i]);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].trim().startsWith("|")) { rows.push(cells(lines[i])); i++; }
+      out.push(
+        `<table class="md-table"><thead><tr>${head.map((c) => `<th>${inlineMd(c)}</th>`).join("")}</tr></thead>` +
+        `<tbody>${rows.map((r) => `<tr>${r.map((c) => `<td>${inlineMd(c)}</td>`).join("")}</tr>`).join("")}</tbody></table>`
+      );
+      continue;
+    }
+    para.push(line);
+    i++;
+  }
+  flush();
+  return out.join("\n");
+}
+
 function buildWelcome() {
   const mode = (current() && current().mode) || "generate";
   const div = document.createElement("div");
   div.className = "welcome";
   const genCards = [
     "写一个函数，对字符串列表去重并按字典序排序",
-    "实现一个用户名校验函数，判断长度与合法字符",
-    "写一个求数字列表平均值的函数，处理空列表",
+    "用 HTML 做一个购物网页，包含商品列表、搜索和购物车",
+    "用 Java 做一个控制台学生管理系统项目",
+    "用 C 语言做一个命令行计算器项目",
   ];
   const reviewCards = [
     "def add(a, b):\n    return a + b",
@@ -642,10 +835,10 @@ function buildWelcome() {
   ];
   const cards = mode === "review" ? reviewCards : genCards;
   div.innerHTML = `
-    <h2>多智能体 Python 代码生成与辅助审查</h2>
+    <h2>多智能体多语言代码生成与辅助审查</h2>
     <p>${mode === "review"
       ? "粘贴已有代码，系统只做静态审核与测试，不生成代码"
-      : "输入需求，系统将先确认需求，再生成代码并完成审核与测试"}</p>
+      : "输入需求，自动识别 Python / Java / C / HTML，生成单文件或多文件项目并完成审核与检查"}</p>
     <div class="suggestions">
       ${cards.map((c) => `<button class="sug-card">${esc(c)}</button>`).join("")}
     </div>`;
@@ -655,21 +848,21 @@ function buildWelcome() {
   return div;
 }
 
-/* 需求澄清卡：未回答时可填写；已回答或已翻篇时只读展示 */
+/* 需求澄清卡：仿豆包提问文案；未回答时保留输入框，保证澄清流程可用 */
 function questionCard(m, index, total) {
   const data = m.data || {};
   const questions = data.questions || [];
   const answered = m.answered || index !== total - 1;
   if (answered) {
-    const answers = (m.answers || []).map((a) => `
+    const pairs = (m.answers || []).map((a) => `
       <div class="qa-pair">
         ${a.question ? `<div class="qa-q">${esc(a.question)}</div>` : ""}
         <div class="qa-a">${esc(a.answer)}</div>
       </div>`).join("");
     return `
-    <div class="a-card">
-      <div class="a-card-title">需求澄清 <span class="tag">已回答</span></div>
-      ${answers || `<div class="qa-note">已提交补充说明，继续执行后续流程。</div>`}
+    <div class="md-bubble">
+      <div class="md"><p>💬 <strong>需求澄清</strong>（已回答）</p></div>
+      ${pairs || `<div class="qa-note">已提交补充说明，继续执行后续流程。</div>`}
     </div>`;
   }
   const fields = questions.map((q, i) => `
@@ -678,166 +871,198 @@ function questionCard(m, index, total) {
       <textarea class="qa-input" data-q="${i}" rows="2" placeholder="请填写你的回答…"></textarea>
     </div>`).join("");
   return `
-  <div class="a-card qa-card" data-index="${index}">
-    <div class="a-card-title">需求需要确认 <span class="tag">${questions.length} 个问题</span></div>
-    <div class="qa-tip">回答后将继续生成代码，并完成审核与测试；未回答前不会输出代码。</div>
+  <div class="md-bubble qa-card" data-index="${index}">
+    <div class="md">
+      <p>💬 <strong>需求需要确认</strong>（${questions.length} 个问题）</p>
+      <p class="qa-tip">回答后将继续生成代码，并完成审核与测试；未回答前不会输出代码。</p>
+    </div>
     ${fields}
     <div class="qa-actions"><button class="qa-submit" data-index="${index}">提交回答并继续</button></div>
   </div>`;
 }
 
-/* ---------------- 结果卡片 ---------------- */
-function renderResult(d) {
-  let html = "";
-  if (d.requirement) html += requirementCard(d.requirement);
-  (d.versions || []).forEach((v) => { html += versionBlock(v, d); });
-  return html;
+/* ---------------- 结果输出（仿豆包富文本答案） ---------------- */
+const LANGUAGE_NAMES = {
+  python: "Python",
+  java: "Java",
+  c: "C",
+  html: "HTML / CSS / JS",
+  css: "CSS",
+  javascript: "JavaScript",
+  markdown: "Markdown",
+  json: "JSON",
+};
+
+function languageName(code) {
+  return LANGUAGE_NAMES[code] || code || "Python";
 }
 
-function requirementCard(r) {
-  const grid = (k, v) => `<div class="k">${k}</div><div class="v">${v}</div>`;
-  const list = (arr) => arr && arr.length
-    ? `<ul class="req-list">${arr.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : "无";
-  return `
-  <div class="a-card">
-    <div class="a-card-title">需求确认 <span class="tag">${esc(r.function_name)}</span></div>
-    <div class="req-grid">
-      ${grid("功能标题", esc(r.title))}
-      ${grid("需求重述", esc(r.restated_requirement))}
-      ${grid("输入", esc((r.inputs || []).join("；")))}
-      ${grid("输出", esc(r.outputs))}
-      ${grid("边界场景", list(r.edge_cases))}
-      ${grid("实现约束", list(r.constraints))}
-      ${grid("验收标准", list(r.acceptance_criteria))}
-      ${grid("假设", list(r.assumptions))}
-    </div>
-    ${r.questions && r.questions.length ? `<div style="margin-top:10px;color:var(--major)">待澄清：${esc(r.questions.join("；"))}</div>` : ""}
-  </div>`;
-}
-
-function versionBlock(v, d) {
-  const label = d.mode === "review"
-    ? "待审核代码"
-    : (v.round === 0 ? "初始生成" : `第 ${v.round} 轮修复`);
-  let html = `<div class="version-head"><span class="num">${v.version_no}</span>${label}</div>`;
-  html += codeCard(v.solution_code);
-  if (v.test_code) {
-    html += `<details class="a-card" style="padding:10px 14px"><summary style="cursor:pointer;font-size:12.5px;color:var(--text-2)">查看测试代码 test_solution.py</summary>${codeCardInner(v.test_code)}</details>`;
-  }
-  if (v.review) html += reviewCard(v.review);
-  if (v.pytest) html += pytestCard(v.pytest);
-  return html;
-}
-
-function codeCard(code) {
-  return `<div class="a-card"><div class="a-card-title">实现代码</div>${codeCardInner(code)}</div>`;
-}
-function codeCardInner(code) {
-  const id = "co_" + Math.random().toString(36).slice(2, 9);
-  return `
-  <div class="code-wrap">
-    <div class="code-head"><span>Python</span><button class="copy-btn" data-target="${id}">复制</button></div>
-    <pre class="code" id="${id}">${esc(code)}</pre>
-  </div>`;
-}
-
-function scorecardBlock(sc) {
-  if (!sc) return "";
-  const dims = sc.dimensions.map((d) => `
-    <div class="dim-row">
-      <span class="dim-name">${esc(d.name)}</span>
-      <div class="dim-bar"><div class="dim-fill" style="width:${d.score * 10}%"></div></div>
-      <span class="dim-score">${d.score}</span>
-    </div>`).join("");
-  const actions = sc.top_actions && sc.top_actions.length
-    ? `<div class="top-actions">
-         <div class="ta-title">优先改进</div>
-         ${sc.top_actions.map((a) => `<div class="ta-item">${esc(a)}</div>`).join("")}
-       </div>` : "";
-  return `
-  <div class="scorecard">
-    <div class="sc-head">
-      <div class="sc-score">
-        <span class="sc-num">${sc.overall_score}</span><span class="sc-max">/100</span>
-        <span class="sc-grade grade-${esc(sc.grade)}">${esc(sc.grade)}</span>
-      </div>
-      <span class="pill ${sc.gate_passed ? "pass" : "fail"}">
-        ${sc.gate_passed ? "门禁通过" : "门禁未过"}</span>
-    </div>
-    <div class="dim-list">${dims}</div>
-    ${actions}
-  </div>`;
-}
-
-function knowledgeBlock(hits) {
-  if (!hits || !hits.length) return "";
-  const rows = hits.map((h) => `
-    <div class="kb-item">
-      <div class="kb-head">
-        <span class="kb-src">${esc(h.doc)} · ${esc(h.section)}</span>
-        <span class="kb-score">相关度 ${Math.round((h.score || 0) * 100)}%</span>
-      </div>
-      <div class="kb-text">${esc(h.content)}</div>
-    </div>`).join("");
-  return `
-  <details class="kb-hits">
-    <summary>知识库命中 ${hits.length} 条</summary>
-    <div class="kb-list">${rows}</div>
-  </details>`;
-}
-
-function reviewCard(rep) {
+/* 审核报告 → Markdown：结论 + 评分表 + 问题清单 + 知识库参考 + 总结引用 */
+function reviewMarkdown(rep) {
+  const md = [];
   const counts = rep.counts || {};
-  const badges = ["阻断", "主要", "次要"]
+  const nums = ["阻断", "主要", "次要"]
     .filter((k) => counts[k] > 0)
-    .map((k) => `<span class="count-badge cb-${k}">${k} ${counts[k]}</span>`).join("");
-  const issues = rep.items && rep.items.length
-    ? `<div class="issue-list">${rep.items.map((it) => `
-        <div class="issue sev-${esc(it.severity)}">
-          <div class="issue-top">
-            <span class="issue-view">${esc(it.view)}</span>
-            <span class="count-badge cb-${esc(it.severity)}">${esc(it.severity)}</span>
-            ${esc(it.issue_type)} ${it.line_no ? `<span class="line">第 ${it.line_no} 行</span>` : ""}
-            ${it.source === "llm" ? `<span class="conf">置信 ${Math.round(it.confidence * 100)}%</span>` : ""}
-          </div>
-          <div class="issue-desc">${esc(it.description)}</div>
-          ${it.suggestion ? `<div class="issue-sug">建议：${esc(it.suggestion)}</div>` : ""}
-        </div>`).join("")}</div>`
-    : `<div class="no-issue">未发现阻断/主要问题</div>`;
+    .map((k) => `${k} ${counts[k]}`)
+    .join(" · ");
+  md.push("## 代码审核");
+  md.push((rep.passed ? "✅ **审核通过**" : "❌ **需修复**") + (nums ? `（${nums}）` : ""));
+  const sc = rep.scorecard;
+  if (sc) {
+    md.push("", `**总分 ${sc.overall_score}/100 · 等级 ${sc.grade} · ${sc.gate_passed ? "门禁通过" : "门禁未过"}**`);
+    md.push("", "| 维度 | 得分 |", "| --- | --- |");
+    (sc.dimensions || []).forEach((dim) => md.push(`| ${dim.name} | ${dim.score}/10 |`));
+    if (sc.top_actions && sc.top_actions.length) {
+      md.push("", "**优先改进**");
+      sc.top_actions.forEach((a, i) => md.push(`${i + 1}. ${a}`));
+    }
+  }
+  if (rep.items && rep.items.length) {
+    md.push("", "**问题清单**");
+    rep.items.forEach((it, i) => {
+      const loc = it.line_no ? `第 ${it.line_no} 行 · ` : "";
+      const sug = it.suggestion ? ` 建议：${it.suggestion}` : "";
+      md.push(`${i + 1}. **[${it.severity}·${it.view}]** ${loc}${it.issue_type}：${it.description}${sug}`);
+    });
+  } else {
+    md.push("", "未发现阻断/主要问题。");
+  }
+  if (rep.knowledge_hits && rep.knowledge_hits.length) {
+    md.push("", "**知识库参考**");
+    rep.knowledge_hits.forEach((h) =>
+      md.push(`- ${h.doc} · ${h.section}（相关度 ${Math.round((h.score || 0) * 100)}%）`));
+  }
+  if (rep.summary) md.push("", `> ${rep.summary}`);
+  return md;
+}
+
+/* 测试/项目检查结果 → Markdown：结论 + 计数 + 失败详情代码块 */
+function pytestMarkdown(p, language) {
+  const isPython = !language || language === "python";
+  const title = isPython ? "测试结果" : "项目检查";
+  const unit = isPython ? "用例" : "检查项";
+  const state = p.all_green
+    ? "✅ **通过**"
+    : (p.total === 0 ? "⏭️ **跳过**（未提供测试）" : "❌ **未通过**");
+  const md = ["## " + title,
+    `${state} · ${unit} ${p.total} · 通过 ${p.passed} · 失败 ${p.failed} · 耗时 ${p.duration}s`];
+  if (p.traceback) md.push("", fence(p.traceback, "text"));
+  return md;
+}
+
+/* 完整结果 → 仿豆包答案文档：状态开头，需求/代码/审核/测试分节展开 */
+function resultToMarkdown(d) {
+  const md = [];
+  const isReview = d.mode === "review";
+  const ok = d.status === "COMPLETED";
+  const running = d.status === "RUNNING";
+  const head = running
+    ? (isReview ? "审核中" : "生成中")
+    : (isReview ? "审核完成" : (ok ? "生成完成" : "已保留最优版本"));
+  const lang = languageName(d.language);
+  const isProject = Boolean(d.project_name || (d.final_files && d.final_files.length > 2));
+  const form = isReview ? "只审核" : (isProject ? "多文件项目" : "单函数");
+  md.push(`${running ? "⏳" : (ok ? "✅" : "⚠️")} **${head}** · ${lang} · ${form}`);
+  if (!ok && !isReview && !running) {
+    md.push("", "> 达到最大修复轮次仍未完全收敛，以下为当前最优版本，未解决问题见审核报告。");
+  }
+
+  const r = d.requirement;
+  if (r) {
+    md.push("", "## 需求确认");
+    if (r.title) md.push(`- **功能**：${r.title}`);
+    if (r.restated_requirement) md.push(`- **需求重述**：${r.restated_requirement}`);
+    if (r.inputs && r.inputs.length) md.push(`- **输入**：${r.inputs.join("；")}`);
+    if (r.outputs) md.push(`- **输出**：${r.outputs}`);
+    if (r.edge_cases && r.edge_cases.length) md.push(`- **边界场景**：${r.edge_cases.join("；")}`);
+    if (r.constraints && r.constraints.length) md.push(`- **实现约束**：${r.constraints.join("；")}`);
+    if (r.acceptance_criteria && r.acceptance_criteria.length) md.push(`- **验收标准**：${r.acceptance_criteria.join("；")}`);
+    if (r.assumptions && r.assumptions.length) md.push(`- **假设**：${r.assumptions.join("；")}`);
+  }
+
+  let versions = d.versions || [];
+  if (!versions.length && (d.final_code || (d.final_files && d.final_files.length))) {
+    // 流式中间态：版本尚未归档（test 节点才入 versions），
+    // 用最终字段拼一个临时版本，让代码/审核/测试随进度逐段出现。
+    versions = [{
+      version_no: 1,
+      round: d.repair_rounds || 0,
+      language: d.language || "python",
+      solution_code: d.final_code || "",
+      test_code: d.final_test || "",
+      project_name: d.project_name || "",
+      files: d.final_files || [],
+      entry_file: d.entry_file || "",
+      run_command: d.run_command || "",
+      review: d.final_review || null,
+      pytest: d.final_pytest || null,
+    }];
+  }
+  versions.forEach((v) => {
+    const label = isReview ? "待审核代码" : (v.round === 0 ? "初始生成" : `第 ${v.round} 轮修复`);
+    const vlang = v.language || d.language || "python";
+    if (v.files && v.files.length && (v.project_name || v.files.length > 2)) {
+      md.push("", `## ${label}（${v.files.length} 个文件）`);
+      if (v.project_name) md.push(`- **工程**：${v.project_name}`);
+      md.push(`- **语言**：${languageName(vlang)}`);
+      if (v.entry_file) md.push(`- **入口**：\`${v.entry_file}\``);
+      if (v.run_command) md.push(`- **运行**：\`${v.run_command}\``);
+      v.files.forEach((f) => {
+        md.push("", `### \`${f.path}\``, fence(f.content || "", f.language || vlang));
+      });
+    } else {
+      md.push("", `## ${label}`, fence(v.solution_code || "", vlang));
+      if (v.test_code) md.push("", "**测试代码**（test_solution.py）", fence(v.test_code, "python"));
+    }
+    if (v.review) md.push("", ...reviewMarkdown(v.review));
+    if (v.pytest) md.push("", ...pytestMarkdown(v.pytest, vlang));
+  });
+  return md.join("\n");
+}
+
+function renderResult(d) {
+  // 仿豆包答案：富文本分节展示；保留“导出结果 ZIP”按钮，导出能力不受影响
   return `
-  <div class="a-card">
-    <div class="a-card-title">代码审核</div>
-    <div class="review-status">
-      <span class="pill ${rep.passed ? "pass" : "fail"}">${rep.passed ? "审核通过" : "需修复"}</span>
-      <div class="counts">${badges}</div>
-    </div>
-    ${scorecardBlock(rep.scorecard)}
-    ${knowledgeBlock(rep.knowledge_hits)}
-    ${issues}
-    <div style="margin-top:10px;font-size:12.5px;color:var(--text-2)">${esc(rep.summary)}</div>
+  <div class="md-bubble">
+    <div class="result-actions"><button class="export-btn" type="button">导出结果 ZIP</button></div>
+    <div class="md">${mdToHtml(resultToMarkdown(d))}</div>
   </div>`;
 }
 
-function pytestCard(p) {
-  const green = p.all_green;
-  const skipped = p.total === 0;
-  const bigCls = green ? "green" : (skipped ? "" : "red");
-  const bigTxt = green ? "通过" : (skipped ? "跳过" : "未通过");
-  return `
-  <div class="a-card">
-    <div class="a-card-title">pytest 测试</div>
-    <div class="pytest-card">
-      <span class="pytest-big ${bigCls}">${bigTxt}</span>
-      <div class="pytest-meta">
-        <span>用例 <b>${p.total}</b></span>
-        <span>通过 <b>${p.passed}</b></span>
-        <span>失败 <b>${p.failed}</b></span>
-        <span>耗时 <b>${p.duration}s</b></span>
-      </div>
-    </div>
-    ${p.traceback ? `<details style="margin-top:10px"><summary class="tb-toggle">查看详情</summary>
-      <div class="tb-text">${esc(p.traceback)}</div></details>` : ""}
-  </div>`;
+/* 导出按钮只在当前会话可用；历史结果统一导出该会话最近一次完整结果。 */
+function bindExportButtons() {
+  messagesEl.querySelectorAll(".export-btn").forEach((btn) => {
+    btn.onclick = async () => {
+      const conversation = current();
+      if (!conversation || !conversation.id) return;
+      const original = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "正在打包…";
+      try {
+        const response = await fetch(
+          `/api/conversations/${encodeURIComponent(conversation.id)}/export?format=zip&scope=latest`
+        );
+        if (!response.ok) {
+          const detail = await response.json().catch(() => ({}));
+          throw new Error(detail.detail || `导出失败（HTTP ${response.status}）`);
+        }
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `conversation_${conversation.id.slice(0, 12)}.zip`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+      } catch (err) {
+        window.alert(err.message || "导出失败");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    };
+  });
 }
 
 /* ============================== 事件绑定 ============================== */
@@ -887,7 +1112,10 @@ messagesEl.addEventListener("click", (e) => {
 async function checkHealth() {
   try {
     const h = await fetchJson("/api/health");
-    const prefix = h.mode === "api" ? "真实 API · " : "离线 · ";
+    testMode = Boolean(h.test_mode);
+    const prefix = h.mode === "local"
+      ? "本地模型 · "
+      : (h.mode === "api" ? "真实 API · " : "离线 · ");
     const memory = h.memory === "mysql" ? " · 记忆已持久化" : " · 记忆不可用";
     const rag = h.rag && h.rag.available
       ? ` · 知识库 ${h.rag.chunks} 条`
@@ -901,6 +1129,8 @@ async function checkHealth() {
 /* ============================== 启动 ============================== */
 async function bootstrap() {
   setModeUI("generate");
+  // 先读取测试模式标记，确保首个会话编号也使用正确前缀
+  await checkHealth();
   try {
     const body = await fetchJson("/api/conversations");
     conversations = (body.conversations || []).map((c) => ({
@@ -916,7 +1146,6 @@ async function bootstrap() {
     currentId = conversations[0].id;
     await selectConversation(currentId);
   }
-  checkHealth();
 }
 
 bootstrap();
