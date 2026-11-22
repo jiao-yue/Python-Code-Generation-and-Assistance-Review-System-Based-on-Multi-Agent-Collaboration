@@ -16,7 +16,7 @@ FastAPI 后端：把“多智能体 Python 代码生成与审查系统”通过 
     GET    /                          打开前端网页（web/index.html）
 
 两个聊天接口都以 SSE（Server-Sent Events）逐段推送：
-    {"type": "stage", ...}   阶段进度（正在确认需求/生成/审核/测试/修复）；
+    {"type": "stage", "partial": ...}  阶段进度 + 该时刻的增量结果（流式渲染）；
     {"type": "result", ...}  最终完整结果；
     {"type": "error", ...}   运行出错信息。
 
@@ -30,12 +30,13 @@ import contextlib
 import json
 import uuid
 from collections.abc import Iterator
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
@@ -45,12 +46,19 @@ from graph.chat_graph import has_pending_clarification, new_thread_id, stream_ch
 from models.chat_schemas import ChatPipelineResult
 from services.chat_memory import chat_memory
 from services.document_parser import UploadError
+from services.export_service import ExportError, ExportTooLarge, build_conversation_export
 from services.rag_retriever import rag_retriever
 from services.upload_service import AttachmentText, upload_service
 
 # 项目根目录（本文件在 <root>/api/server.py，向上一级即根）
 ROOT_DIR = Path(__file__).resolve().parents[1]
 WEB_DIR = ROOT_DIR / "web"
+
+
+def _new_conversation_id() -> str:
+    """生成会话编号；测试模式下加 test_ 前缀，便于测试结束自动清理。"""
+    prefix = "test_" if settings.TEST_MODE else "c_"
+    return f"{prefix}{uuid.uuid4().hex[:12]}"
 
 
 # ===========================================================================
@@ -110,23 +118,6 @@ class ChatResumeRequest(BaseModel):
 # ===========================================================================
 # 序列化与 SSE 工具
 # ===========================================================================
-def serialize_chat(state: dict[str, Any]) -> dict[str, Any]:
-    """把图的最终状态整理成前端使用的 JSON 友好结构。"""
-    result = ChatPipelineResult(
-        mode=state.get("mode", "generate"),
-        run_id=state.get("run_id", ""),
-        status=state.get("status", "COMPLETED"),
-        requirement=state.get("confirmed"),
-        versions=state.get("versions", []),
-        final_code=state.get("solution_code", ""),
-        final_review=state.get("review"),
-        final_pytest=state.get("pytest_result"),
-        repair_rounds=state.get("round", 0),
-        raw_input=state.get("raw_requirement", ""),
-    )
-    return result.to_frontend()
-
-
 def _sse_line(data: dict[str, Any]) -> str:
     """把一条数据包装成 SSE 的 data 行。"""
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -223,7 +214,7 @@ def chat_event_stream(
                 )
                 return
             if event["type"] == "stage":
-                # 阶段事件：只把前端需要的字段透传
+                # 阶段事件：透传进度文案与增量结果，前端边收边渲染
                 yield _sse_line(
                     {
                         "type": "stage",
@@ -231,11 +222,12 @@ def chat_event_stream(
                         "label": event["label"],
                         "solution_code": event["solution_code"],
                         "round": event["round"],
+                        "partial": event.get("partial"),
                     }
                 )
             else:
                 # 最终状态：序列化后持久化，并作为结果事件推送
-                final_payload = serialize_chat(event["state"])
+                final_payload = ChatPipelineResult.from_state(event["state"]).to_frontend()
                 turn_no = _next_turn_no(conversation_id)
                 if result_only:
                     chat_memory.save_assistant_result(
@@ -303,7 +295,11 @@ app.add_middleware(
 def health() -> dict[str, Any]:
     """健康检查：返回模型提供方、模型名、运行模式、持久记忆与知识库状态。"""
     api_key, _base, model = settings.get_llm_endpoint()
-    mode = "mock" if (settings.FORCE_MOCK or not api_key) else "api"
+    is_local = settings.LLM_PROVIDER == "ollama"
+    # 本地 Ollama 不需要 Key，单独标记为 local，前端据此显示“本地模型”。
+    mode = "mock" if (settings.FORCE_MOCK or (not api_key and not is_local)) else (
+        "local" if is_local else "api"
+    )
     # 首次调用时确保向量索引已建好，让前端能展示“知识库 N 条”
     rag_available = rag_retriever.ensure_index()
     rag_stats = rag_retriever.stats()
@@ -313,6 +309,7 @@ def health() -> dict[str, Any]:
         "provider": settings.LLM_PROVIDER,
         "model": model,
         "mode": mode,
+        "test_mode": settings.TEST_MODE,
         "max_rounds": settings.MAX_ROUNDS,
         "memory": "mysql" if chat_memory.available else "unavailable",
         "rag": rag_stats,
@@ -348,6 +345,38 @@ def get_conversation(conversation_id: str) -> dict[str, Any]:
     if conversation is None:
         raise HTTPException(status_code=404, detail="会话不存在或数据库不可用")
     return conversation
+
+
+@app.get("/api/conversations/{conversation_id}/export")
+def export_conversation(
+    conversation_id: str,
+    format: str = "zip",
+    scope: str = "latest",
+) -> Response:
+    """导出会话结果。
+
+    - format=zip：返回 ZIP，内含需求、各轮代码/测试/审核报告/pytest 结果；
+    - scope=latest：只导出最后一次结果；scope=all：导出所有轮次结果。
+    """
+    if format.lower() != "zip":
+        raise HTTPException(status_code=400, detail="当前仅支持 format=zip")
+    if scope not in ("latest", "all"):
+        raise HTTPException(status_code=400, detail="scope 只能是 latest 或 all")
+    conversation = chat_memory.get_conversation(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="会话不存在或数据库不可用")
+    try:
+        payload = build_conversation_export(conversation, scope=scope)
+    except ExportTooLarge as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except ExportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    filename = f"conversation_{conversation_id[:12]}_{datetime.now():%Y%m%d_%H%M%S}.zip"
+    return Response(
+        content=payload,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.patch("/api/conversations/{conversation_id}")
@@ -474,7 +503,7 @@ def chat_generate(req: ChatGenerateRequest) -> StreamingResponse:
     requirement = _generation_input(req.requirement, attachments)
     if not requirement.strip():
         raise HTTPException(status_code=400, detail="需求或附件不能为空")
-    conversation_id = req.conversation_id or f"c_{uuid.uuid4().hex[:12]}"
+    conversation_id = req.conversation_id or _new_conversation_id()
     fallback_title = req.requirement.strip()[:18]
     if not fallback_title and attachments:
         fallback_title = attachments[0].filename[:18]
@@ -500,7 +529,7 @@ def chat_review(req: ChatReviewRequest) -> StreamingResponse:
     code = _review_input(req.code, attachments)
     if not code.strip():
         raise HTTPException(status_code=400, detail="待审核代码或代码附件不能为空")
-    conversation_id = req.conversation_id or f"c_{uuid.uuid4().hex[:12]}"
+    conversation_id = req.conversation_id or _new_conversation_id()
     requirement = req.context or "请审核以下代码的质量、安全与逻辑。"
     # 优先用前端标题，否则默认“代码审核”
     review_title = req.title.strip() or "代码审核"
