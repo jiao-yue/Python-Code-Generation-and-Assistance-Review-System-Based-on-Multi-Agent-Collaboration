@@ -12,9 +12,10 @@
   原始文件按完整字节 MD5 去重，图片与扫描 PDF 使用本地 OCR 提取文字。
 
 后端用 **FastAPI** 搭建，核心流程由 **LangGraph** 状态图编排，提示词采用 **few-shot 示例模式**，
-结果以 **SSE 阶段流式**返回；会话与每轮消息持久化到 **MySQL**（新建即落库、刷新不丢失、
-删除即同步删库、消息编号连续无空洞）。前端为参考豆包的简洁聊天界面，纯文字、无图片/logo，
-无需 Node 构建。
+结果以 **SSE 增量流式**返回：每个节点完成即推送当前进度（`partial`），前端边收边逐行揭示，
+收尾后切换为完整答案；会话与每轮消息持久化到 **MySQL**（新建即落库、刷新不丢失、
+删除即同步删库、消息编号连续无空洞）。前端为仿豆包聊天界面：用户消息在右、助手答案在左，
+答案为 Markdown 富文本（标题、列表、代码块、表格），纯文字、无图片/logo，无需 Node 构建。
 
 ---
 
@@ -81,6 +82,7 @@ python -m uvicorn api.server:app --host 127.0.0.1 --port 8000
 | 收敛判定 | 无阻断问题且项目检查全绿即收敛，否则进入定向修复闭环（最多 `MAX_ROUNDS` 轮） |
 | 定向修复 | 按问题清单做最小化补丁，重新生成多文件项目，保留可回退版本 |
 | 结果导出 | 会话结果一键导出 ZIP，包含需求、各轮 `files/` 项目文件、审核报告、检查结果与 manifest |
+| 流式输出 | 每个节点完成即推送 `partial` 当前进度，前端带光标逐行揭示，收尾后切换完整答案与导出按钮 |
 | 基准评测 | 15 HumanEval + 15 MBPP + 10 自测任务，使用官方 pytest 作为客观判据 |
 | 消融实验 | G1 直接生成 / G2 +pytest 修复 / G3 +静态规则 / G4 完整链路，输出 Pass@1、可运行率、收敛率等 |
 | 缺陷评测 | 20 个注入缺陷 + 20 个 clean 对照，输出规则/LLM/联合审查的 Recall 与 FPR |
@@ -181,18 +183,24 @@ test（Python pytest；Java javac + 运行；C gcc 编译链接 + 运行；HTML/
 `review_only → test_only → finish_review`：只做静态审核与 LLM 审核；用户附了测试才运行 pytest，
 不生成代码。仅审核模式允许不附测试，不会因为 `total=0` 被自动判阻断。
 
-### 4. SSE 阶段流式输出
+### 4. SSE 增量流式输出
 
-后端以 `text/event-stream` 逐阶段推送，页面加载提示随阶段实时更新。阶段标签在
-`graph/chat_graph.py` 的 `STAGE_LABELS` 中维护，包括需求确认、生成、审核、测试、修复、
-完成与 best-effort。
+后端以 `text/event-stream` 推送：每个 LangGraph 节点完成时立即推送一条 `stage` 事件，携带
+`partial`——该时刻序列化出的“当前进度”（与最终结果同一口径，经
+`ChatPipelineResult.from_state()`）。前端把已接收内容逐行揭示（末尾闪烁光标），
+需求 → 代码 → 审核 → 测试各节随进度依次出现；`result` 到达且揭示追平后切换为完整答案，
+并显示“导出结果 ZIP”。阶段标签在 `graph/chat_graph.py` 的 `STAGE_LABELS` 中维护。
 
 SSE 事件共四类：
 
-- `stage`：`{"type":"stage","node":...,"label":...,"solution_code":...,"round":...}`
+- `stage`：`{"type":"stage","node":...,"label":...,"solution_code":...,"round":...,"partial":<当前进度 payload>}`
 - `interrupt`：`{"type":"interrupt","conversation_id":...,"thread_id":...,"questions":[...]}`
 - `result`：`{"type":"result","conversation_id":...,"data":<完整前端 payload>}`
 - `error`：`{"type":"error","message":...}`
+
+流式中间态里版本尚未归档（test 节点才入 `versions`），前端用
+`final_code/final_files/final_review/final_pytest` 拼临时版本做增量展示，
+保证代码与报告随进度出现，而不是最后一次性弹出。
 
 ### 5. 三路并行审查
 
@@ -421,13 +429,13 @@ Graduation Project/
 │   └── server.py              # FastAPI：REST + SSE + multipart 上传，同时托管前端静态资源
 ├── web/                       # 前端（HTML/CSS/JS，无需构建）
 │   ├── index.html             # 单页结构（纯文字，无图片/logo）与附件上传控件
-│   ├── styles.css             # 豆包式简洁样式、历史项、附件列表与窄屏适配
-│   └── app.js                 # 会话管理、SSE、附件上传/移除/入库、结果/评分卡/问答卡渲染
+│   ├── styles.css             # 豆包式样式、左右布局、流式光标、历史项与窄屏适配
+│   └── app.js                 # 会话管理、SSE 增量流式与逐行揭示、附件、富文本答案与问答卡渲染
 ├── graph/
 │   └── chat_graph.py          # LangGraph 状态图：节点、条件边、中断恢复、阶段流式
 ├── models/
 │   ├── common.py              # 通用枚举与 pytest 结果模型
-│   └── chat_schemas.py        # 需求、审核项、评分卡、RAG 命中、版本与流水线结果
+│   └── chat_schemas.py        # 需求、审核项、评分卡、RAG 命中、版本与流水线结果（from_state 支持流式中间态）
 ├── prompts/
 │   └── chat_prompts.py        # few-shot 提示词：需求确认/合并/生成/审核/修复
 ├── knowledge/                 # RAG 知识库（7 篇 Markdown，41 个片段）
@@ -656,9 +664,9 @@ python -m uvicorn api.server:app --host 127.0.0.1 --port 8000
 
 在侧边栏可切换两种模式：
 
-- **代码生成**：输入需求，依次展示需求确认、代码、审核问题、pytest 结果；需求不明确时先弹出问答卡，
-  回答后继续生成；失败时自动修复并追加新版本；
-- **只审核代码**：粘贴代码（可附测试），只展示审核与测试结果，不生成代码；
+- **代码生成**：输入需求，答案随各阶段完成逐行揭示（需求确认 → 代码 → 审核 → 测试）；
+  需求不明确时先弹出问答卡，回答后继续生成；失败时自动修复并追加新版本；
+- **只审核代码**：粘贴代码（可附测试），流式展示审核与测试结果，不生成代码；
 - **添加附件**：选择文件后可只用于当前对话，或勾选“导入知识库”；附件列表显示重复复用、解析警告和
   索引进度，发送前可移除。图片与扫描 PDF 的识别文字会作为材料，不把图片当作通用视觉问答输入。
 
@@ -727,7 +735,7 @@ OCR 单元测试使用可重复桩，真实 RapidOCR 中英文识别另行做端
 6. 敏感信息（API Key、数据库口令）只从 `.env` 读取，不在代码中硬编码；
 7. 超轮次不收敛时 best-effort 输出当前最优代码与未解决清单，不挂起；
 8. 附件原件、对话纯文本与 RAG Markdown 分离，MD5 仅用于内容去重，只有用户显式入库的资料才进入长期索引；
-9. 前端保持简洁、纯文字、无图片/logo，样式与交互统一维护在 `web/` 下。
+9. 前端保持豆包式简洁富文本、用户右/助手左，纯文字、无图片/logo，流式揭示与交互统一维护在 `web/` 下。
 
 
 
