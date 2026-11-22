@@ -112,3 +112,61 @@
 - 未对所有云端/本地模型逐一做全链路测试；本轮真实 API 使用默认 DeepSeek。
 - 未对全部附件类型重新执行真实 OCR；附件与 OCR 的确定性单元测试包含在 77 项测试中。
 - 小模型生成质量不属于接口可用性的充分条件；复杂需求仍可能因模型自身代码/测试质量进入 `BEST_EFFORT`。
+
+## 七、2026-11-22 流式输出与冗余清理回归
+
+本轮改动：前端改为仿豆包富文本答案与左右布局（用户右/助手左），随后升级为 SSE 增量流式
+（`stage` 携带 `partial`，前端逐行揭示）；后端删除无引用死代码并统一静态工具路径口径。
+改动后全部验证如下。
+
+### 7.1 静态检查与单元测试
+
+| 检查项 | 实际命令或入口 | 结果 |
+| --- | --- | --- |
+| Python 单元测试 | `python -m pytest -q` | 重构前后均 77 项通过，退出码 0 |
+| 前端 JS 语法 | `node --check web/app.js` | 通过 |
+| 冗余复扫 | AST 扫描无引用定义/常量/未使用导入/重复函数体 | 全部 0 残留 |
+| 前端 DOM 断言 | Node DOM 桩加载真实 `web/app.js` | 37 项通过（含 8 项流式分支） |
+| 服务健康 | `GET /api/health` | `mode=api`、`model=deepseek-chat`、`memory=mysql` |
+| 前端资源 | `GET /`、`GET /static/app.js?v=19` | 200，且包含流式渲染实现 |
+
+### 7.2 冗余清理清单（功能不变）
+
+- 删除无引用定义：`language_label`、`SUPPORTED_LANGUAGES`、`map_ast`、`dataset_summary`、
+  `load_runs_jsonl`、`list_batches`；
+- 删除死配置：`EVAL_DATASET_DIR`、`EVAL_RESULT_DIR`、`RAG_MAX_CHUNK_CHARS`；
+- Ruff/Bandit 各自内联的相对路径逻辑统一收进 `base_runner.relativize()`，
+  16 组用例（绝对/相对根、子目录根、文件根、越界路径）与旧逻辑输出逐一相同；
+  真实 Ruff/Bandit 运行确认发现项路径仍为 `sub/x.py` 相对口径、严重度不变；
+- `api/server.py` 的 `serialize_chat` 下沉为 `ChatPipelineResult.from_state()`，
+  流式中间态与最终态共用同一序列化口径。
+
+### 7.3 真实 SSE 增量流式
+
+生成模式（加法函数需求）实测各节点 `partial` 递增：
+
+| 节点 | 需求 | 入口代码 | 测试代码 | 审核 | pytest | 状态 |
+| --- | --- | --- | --- | --- | --- | --- |
+| clarify | 有 | 0 字符 | 0 字符 | 无 | 无 | RUNNING |
+| generate | 有 | 642 字符 | 1353 字符 | 无 | 无 | RUNNING |
+| review | 有 | 642 字符 | 1353 字符 | 有 | 无 | RUNNING |
+| test | 有 | 642 字符 | 1353 字符 | 有 | 有 | RUNNING |
+| finish | 有 | 642 字符 | 1353 字符 | 有 | 有 | COMPLETED |
+
+最终 `result` 为 `COMPLETED`；ZIP 导出 PK 头有效；测试会话已删除。
+
+### 7.4 真实浏览器流式观感
+
+在 `http://127.0.0.1:8000/`（v=19）新建对话发送生成需求：
+
+1. 中间态：助手气泡内代码块逐行生长，末尾光标 `▍` 闪烁，下方阶段文案“正在生成代码…”；
+   布局计算值确认用户行 `justify-content: flex-end`、助手行 `flex-start`；
+2. 收尾后：光标消失，状态行“✅ 生成完成 · Python · 单函数”，需求确认/代码/审核/测试分节完整，
+   “导出结果 ZIP”按钮可用；
+3. 验证会话已通过接口删除，用户历史会话未受影响。
+
+### 7.5 本轮未覆盖范围
+
+- 流式揭示节奏为前端每 24ms 揭示 2 行的展示层 pacing，模型调用本身仍为整段 JSON 返回；
+- 未在多文件项目与 Java/C 链路上重复截图流式中间态（其 partial 口径与单函数一致，由 77 项测试覆盖）；
+- 后端改动需重启服务生效，本轮已用 `python -m api.server` 重启并复核健康检查。
